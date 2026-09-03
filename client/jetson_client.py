@@ -1,21 +1,41 @@
-# sudo apt update && sudo apt install mpv -y
-
 import cv2
 import requests
 import sys
 import subprocess
 import urllib.parse
+import threading
 import time
 
-# Change this to your Mac's IP address on the local network
-SERVER_URL = "http://192.168.X.X:8000/interact"
+SERVER_URL = "http://172.16.92.123:8000/interact" # Update with your Mac's IP
 
-video_capture_object = cv2.VideoCapture(0)
-if not video_capture_object.isOpened():
-    print("FATAL ERROR: Could not map local device to camera.")
-    sys.exit(1)
+class LiveCameraStream:
+    """Continuously consumes frames in a background thread to prevent buffer lag."""
+    def __init__(self, src=0):
+        self.stream = cv2.VideoCapture(src)
+        if not self.stream.isOpened():
+            print("FATAL ERROR: Could not map local device to camera.")
+            sys.exit(1)
+        self.grabbed, self.frame = self.stream.read()
+        self.stopped = False
+
+    def start(self):
+        threading.Thread(target=self.update, daemon=True).start()
+        return self
+
+    def update(self):
+        while not self.stopped:
+            self.grabbed, self.frame = self.stream.read()
+
+    def read(self):
+        return self.grabbed, self.frame
+
+    def stop(self):
+        self.stopped = True
+        self.stream.release()
 
 print("\n⚡ Jetson Edge Client Initialized. Connected to Dhruv Core.")
+cam = LiveCameraStream(0).start()
+time.sleep(1.0) # Allow camera sensor to warm up
 
 try:
     while True:
@@ -26,22 +46,19 @@ try:
             continue
             
         print("Capturing live frame...")
-        # Flush the buffer to get the freshest frame
-        for _ in range(5):
-            frame_grab_status, raw_matrix_frame = video_capture_object.read()
+        # Instantly grabs the frame captured milliseconds ago by the background thread
+        frame_grab_status, raw_matrix_frame = cam.read()
             
         if not frame_grab_status:
             print("Camera error.")
             continue
             
-        # Encode to tiny JPEG bytes
         success, compression_buffer = cv2.imencode('.jpg', raw_matrix_frame)
         if not success:
             continue
             
         print("Transmitting context to Dhruv Brain...")
         try:
-            # We use stream=True to process the audio chunk-by-chunk as it arrives
             response = requests.post(
                 SERVER_URL, 
                 data={"query": query}, 
@@ -51,12 +68,14 @@ try:
             )
             
             if response.status_code == 200:
-                # 1. Print the text response embedded in the HTTP headers instantly
+                img_status = response.headers.get("X-Image-Status", "")
+                if img_status:
+                    print(f"[Server Vision Status]: {urllib.parse.unquote(img_status)}")
+
                 encoded_text = response.headers.get("X-Agent-Text", "")
                 if encoded_text:
                     print(f"Dhruv: {urllib.parse.unquote(encoded_text)}")
                 
-                # 2. Pipe the streaming audio payload directly into the Jetson's speakers via mpv
                 mpv_process = subprocess.Popen(
                     ['mpv', '--no-video', '--really-quiet', '-'],
                     stdin=subprocess.PIPE
@@ -66,10 +85,8 @@ try:
                     if chunk:
                         mpv_process.stdin.write(chunk)
                 
-                # Close the pipe and wait for the audio to finish playing
                 mpv_process.stdin.close()
                 mpv_process.wait()
-                
             else:
                 print(f"Server Error: {response.status_code} - {response.text}")
                 
@@ -77,5 +94,5 @@ try:
             print(f"Network failure: {e}")
             
 finally:
-    video_capture_object.release()
+    cam.stop()
     print("Jetson offline.")
