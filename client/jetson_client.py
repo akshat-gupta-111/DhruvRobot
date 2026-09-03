@@ -5,11 +5,11 @@ import subprocess
 import urllib.parse
 import threading
 import time
+import re
 
 SERVER_URL = "http://172.16.92.123:8000/interact" # Update with your Mac's IP
 
 class LiveCameraStream:
-    """Continuously consumes frames in a background thread to prevent buffer lag."""
     def __init__(self, src=0):
         self.stream = cv2.VideoCapture(src)
         if not self.stream.isOpened():
@@ -33,17 +33,9 @@ class LiveCameraStream:
         self.stopped = True
         self.stream.release()
 
-
 print("\n⚡ Jetson Edge Client Initialized. Connected to Dhruv Core.")
 cam = LiveCameraStream(0).start()
 time.sleep(1.0)
-
-auto_search_active = False
-last_query = ""
-
-import re
-
-# ... (keep your existing setup, cam = LiveCameraStream().start(), etc.)
 
 active_tracking_target = None
 
@@ -53,7 +45,6 @@ try:
         if active_tracking_target:
             print(f"\n🔄 [Tracking Mode] Capturing frame for '{active_tracking_target}'...")
             
-            # Flush for freshest frame
             frame_grab_status, raw_matrix_frame = cam.read()
             if not frame_grab_status:
                 continue
@@ -61,7 +52,6 @@ try:
             success, compression_buffer = cv2.imencode('.jpg', raw_matrix_frame)
             
             try:
-                # Ping the FAST endpoint, NOT the LangGraph interact endpoint
                 response = requests.post(
                     f"{SERVER_URL.replace('/interact', '/track')}", 
                     data={"target": active_tracking_target}, 
@@ -75,16 +65,15 @@ try:
                     
                     if "[TARGET_REACHED]" in action_text:
                         print("🎉 Target reached! Returning to Chat Mode.")
-                        active_tracking_target = None # Break the loop
+                        active_tracking_target = None 
                         
-                # Brief sleep to allow physical actuators to complete their micro-movements
                 time.sleep(0.5)
                 
             except Exception as e:
                 print(f"Tracking network error: {e}")
                 active_tracking_target = None
                 
-            continue # Loop back immediately, skipping the chat input!
+            continue 
 
         # --- MODE 2: DELIBERATIVE CHAT MODE ---
         query = input("\nYou: ")
@@ -102,7 +91,8 @@ try:
                 SERVER_URL, 
                 data={"query": query}, 
                 files={"image": ("frame.jpg", compression_buffer.tobytes(), "image/jpeg")},
-                stream=True
+                stream=True,
+                timeout=60 # Prevent hanging if server dies
             )
             
             if response.status_code == 200:
@@ -111,19 +101,77 @@ try:
                     decoded_text = urllib.parse.unquote(encoded_text)
                     print(f"Dhruv: {decoded_text}")
                     
-                    # CHECK FOR STATE TRANSITION TRIGGER
                     match = re.search(r'\[START_TRACKING:\s*(.+?)\]', decoded_text)
                     if match:
                         active_tracking_target = match.group(1).strip()
                         print(f"⚙️ Switching to Reflex Tracking Mode for: {active_tracking_target}")
                 
-                # Stream audio
-                mpv_process = subprocess.Popen(['mpv', '--no-video', '--really-quiet', '-'], stdin=subprocess.PIPE)
+                # --- ROBUST AUDIO PIPE FIX ---
+                mpv_process = subprocess.Popen(
+                    ['mpv', '--no-video', '--really-quiet', '-'], 
+                    stdin=subprocess.PIPE
+                )
+                
+                # Write chunks
                 for chunk in response.iter_content(chunk_size=4096):
                     if chunk:
                         mpv_process.stdin.write(chunk)
-                mpv_process.wait()
+                        
+                # Explicitly close the pipe FIRST so mpv knows the file is done
+                mpv_process.stdin.close()
+                
+                # Wait for playback to finish, with a safety timeout
+                try:
+                    mpv_process.wait(timeout=10.0) 
+                except subprocess.TimeoutExpired:
+                    mpv_process.kill()
+                    print("[Warning] Audio playback timed out.")
+                    
         except Exception as e:
              print(f"Network error: {e}")
+             
 finally:
     cam.stop()
+2. Double-Check the Fast Endpoint (api_server.py)
+When the Jetson successfully switches to Tracking Mode, it hits your /track endpoint. Ensure this endpoint does not try to generate edge-tts audio. It must purely return JSON to keep the loop lightning fast.
+
+Python
+# Verify your /track endpoint looks like this in api_server.py:
+
+@app.post("/track")
+async def track_target(target: str = Form(...), image: UploadFile = File(...)):
+    """The High-Frequency Reflex Loop endpoint (Bypasses LangGraph entirely)."""
+    image_bytes = await image.read()
+    b64_payload = base64.b64encode(image_bytes).decode('utf-8')
+    
+    print(f"\n🎯 [Reflex Tracker] Searching frame for: '{target}'")
+    
+    vision_state = await get_moondream_tracking_json(b64_payload, target)
+    print(f"   ├─ State: {vision_state}")
+    
+    response_action = ""
+    
+    if not vision_state.get("is_there"):
+        response_action = "Target lost. Spinning to search."
+        await ble_manager.send_payload_and_wait({"c": "SPN", "d": "R", "deg": 30, "t": 500}, 500)
+        
+    elif vision_state.get("location") == "left":
+        response_action = "Target left. Nudging left."
+        await ble_manager.send_payload_and_wait({"c": "SPN", "d": "L", "deg": 10, "t": 200}, 200)
+        
+    elif vision_state.get("location") == "right":
+        response_action = "Target right. Nudging right."
+        await ble_manager.send_payload_and_wait({"c": "SPN", "d": "R", "deg": 10, "t": 200}, 200)
+        
+    elif vision_state.get("location") == "center":
+        if vision_state.get("closeness") == "high":
+            response_action = "[TARGET_REACHED] I have reached the target."
+            await ble_manager.send_payload_and_wait({"c": "STP"}, 0)
+        else:
+            response_action = "Target centered. Moving forward."
+            await ble_manager.send_payload_and_wait({"c": "DRV", "d": "F", "t": 1000, "s": 200}, 1000)
+
+    print(f"   └─ Action: {response_action}")
+    
+    # Returns standard JSON - NO AUDIO STREAMING
+    return {"action": response_action}
