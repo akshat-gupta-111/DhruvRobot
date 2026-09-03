@@ -41,37 +41,68 @@ time.sleep(1.0)
 auto_search_active = False
 last_query = ""
 
+import re
+
+# ... (keep your existing setup, cam = LiveCameraStream().start(), etc.)
+
+active_tracking_target = None
+
 try:
     while True:
-        if not auto_search_active:
-            query = input("\nYou: ")
-            if query.strip().lower() in ['exit', 'quit']:
-                break
-            if not query.strip():
+        # --- MODE 1: TRACKING REFLEX LOOP ---
+        if active_tracking_target:
+            print(f"\n🔄 [Tracking Mode] Capturing frame for '{active_tracking_target}'...")
+            
+            # Flush for freshest frame
+            frame_grab_status, raw_matrix_frame = cam.read()
+            if not frame_grab_status:
                 continue
-            last_query = query
-        else:
-            print("\n🔄 [Autonomous Mode] Capturing fresh frame to evaluate environment...")
-            query = "Evaluate the new scene. " + last_query 
-            # Give the rover a brief moment to stabilize after moving before capturing the next frame
-            time.sleep(0.5)
+                
+            success, compression_buffer = cv2.imencode('.jpg', raw_matrix_frame)
+            
+            try:
+                # Ping the FAST endpoint, NOT the LangGraph interact endpoint
+                response = requests.post(
+                    f"{SERVER_URL.replace('/interact', '/track')}", 
+                    data={"target": active_tracking_target}, 
+                    files={"image": ("frame.jpg", compression_buffer.tobytes(), "image/jpeg")},
+                    timeout=10
+                )
+                
+                if response.status_code == 200:
+                    action_text = response.json().get("action", "")
+                    print(f"Reflex Action: {action_text}")
+                    
+                    if "[TARGET_REACHED]" in action_text:
+                        print("🎉 Target reached! Returning to Chat Mode.")
+                        active_tracking_target = None # Break the loop
+                        
+                # Brief sleep to allow physical actuators to complete their micro-movements
+                time.sleep(0.5)
+                
+            except Exception as e:
+                print(f"Tracking network error: {e}")
+                active_tracking_target = None
+                
+            continue # Loop back immediately, skipping the chat input!
 
-        # Flush buffer and grab freshest frame
+        # --- MODE 2: DELIBERATIVE CHAT MODE ---
+        query = input("\nYou: ")
+        if query.strip().lower() in ['exit', 'quit']:
+            break
+        if not query.strip():
+            continue
+            
         frame_grab_status, raw_matrix_frame = cam.read()
-        if not frame_grab_status:
-            continue
-            
         success, compression_buffer = cv2.imencode('.jpg', raw_matrix_frame)
-        if not success:
-            continue
-            
+        
         try:
+            print("Thinking...")
             response = requests.post(
                 SERVER_URL, 
                 data={"query": query}, 
                 files={"image": ("frame.jpg", compression_buffer.tobytes(), "image/jpeg")},
-                stream=True,
-                timeout=60
+                stream=True
             )
             
             if response.status_code == 200:
@@ -80,23 +111,19 @@ try:
                     decoded_text = urllib.parse.unquote(encoded_text)
                     print(f"Dhruv: {decoded_text}")
                     
-                    # TRIGGER AUTONOMOUS LOOP IF TOKEN IS PRESENT
-                    if "[SEARCH_CONTINUES]" in decoded_text:
-                        auto_search_active = True
-                    else:
-                        auto_search_active = False
+                    # CHECK FOR STATE TRANSITION TRIGGER
+                    match = re.search(r'\[START_TRACKING:\s*(.+?)\]', decoded_text)
+                    if match:
+                        active_tracking_target = match.group(1).strip()
+                        print(f"⚙️ Switching to Reflex Tracking Mode for: {active_tracking_target}")
                 
-                # Stream Audio
+                # Stream audio
                 mpv_process = subprocess.Popen(['mpv', '--no-video', '--really-quiet', '-'], stdin=subprocess.PIPE)
                 for chunk in response.iter_content(chunk_size=4096):
                     if chunk:
                         mpv_process.stdin.write(chunk)
-                mpv_process.stdin.close()
                 mpv_process.wait()
-                
         except Exception as e:
-            print(f"Network failure: {e}")
-            auto_search_active = False # Break loop on error
-            
+             print(f"Network error: {e}")
 finally:
     cam.stop()
