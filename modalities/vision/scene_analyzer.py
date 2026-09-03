@@ -8,6 +8,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Moondream Cloud API config
+MOONDREAM_API_URL = "https://api.moondream.ai/v1/caption"
+MOONDREAM_MODEL   = "moondream3.1-9B-A2B"
+
 def image_to_base64_payload(opencv_frame):
     success, compression_buffer = cv2.imencode('.jpg', opencv_frame)
     if not success:
@@ -30,17 +34,16 @@ async def capture_and_analyze(shared_memory: dict, stop_event=None):
         shared_memory["current_scene"] = "Vision Error: Camera not accessible."
         return
 
-    base_url = os.getenv("NGROK_BASE_URL", "").rstrip('/')
-    target_endpoint = f"{base_url}/api/generate"
-    
-    vision_prompt = "Describe the current scene, objects, and people. Do not attempt to read text."
-    
+    api_key = os.getenv("MOONDREAM_API_KEY", "")
+
     network_headers = {
         "Content-Type": "application/json",
-        "User-Agent": "DhruvVisionAgent/1.1"
+        "X-Moondream-Auth": api_key,
+        "User-Agent": "DhruvVisionAgent/2.0"
     }
 
     print("👁️ Dhruv's dual-pipeline vision (Scene + OCR) activated.")
+    print(f"   └─ Using Moondream Cloud API → {MOONDREAM_API_URL}")
 
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -60,22 +63,27 @@ async def capture_and_analyze(shared_memory: dict, stop_event=None):
                 if not base64_payload_string:
                     continue
 
+                # Moondream Cloud API expects a data-URI for the image
+                image_data_uri = f"data:image/jpeg;base64,{base64_payload_string}"
+
                 payload = {
-                    "model": "moondream",
-                    "prompt": vision_prompt,
-                    "stream": False,
-                    "images": [base64_payload_string]
+                    "model": MOONDREAM_MODEL,
+                    "image_url": image_data_uri,
+                    "stream": False
                 }
 
                 try:
                     ocr_task = asyncio.to_thread(extract_text_locally, raw_matrix_frame)
-                    api_task = client.post(target_endpoint, json=payload, headers=network_headers)
+                    api_task = client.post(MOONDREAM_API_URL, json=payload, headers=network_headers)
 
                     ocr_text, response = await asyncio.gather(ocr_task, api_task)
                     
                     scene_description = "Scene unavailable."
                     if response.status_code == 200:
-                        scene_description = response.json().get("response", "").strip()
+                        # Moondream Cloud API returns {"caption": "..."}
+                        scene_description = response.json().get("caption", "").strip()
+                    else:
+                        scene_description = f"API Error {response.status_code}: {response.text[:120]}"
                     
                     combined_context = f"""
                     SCENE DESCRIPTION: {scene_description}
@@ -85,7 +93,7 @@ async def capture_and_analyze(shared_memory: dict, stop_event=None):
                     shared_memory["current_scene"] = combined_context.strip()
                         
                 except httpx.TimeoutException:
-                    shared_memory["current_scene"] = "Vision lagging: Ngrok/Kaggle endpoint timed out."
+                    shared_memory["current_scene"] = "Vision lagging: Moondream Cloud API timed out."
                 except Exception as e:
                     shared_memory["current_scene"] = f"Vision offline: {str(e)}"
 
