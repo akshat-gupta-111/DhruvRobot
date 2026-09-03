@@ -107,3 +107,55 @@ async def capture_and_analyze(shared_memory: dict, stop_event=None):
     finally:
         # 3. Cleanly release the hardware when the loop terminates
         cap.release()
+
+
+# ── Quick API test ────────────────────────────────────────────
+if __name__ == "__main__":
+    import httpx, base64, os
+    from dotenv import load_dotenv
+    load_dotenv()
+
+    print("🧪 Moondream Cloud API — single-frame test")
+
+    # 1. Grab one frame from webcam
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("❌ Camera not accessible."); exit(1)
+
+    for _ in range(5):           # flush stale buffer frames
+        ok, frame = cap.read()
+    cap.release()
+
+    if not ok:
+        print("❌ Failed to read frame."); exit(1)
+
+    print("📸 Frame captured — sending to Moondream API...")
+
+    # 2. Encode to base64 data URI
+    _, buf = cv2.imencode('.jpg', frame)
+    b64 = base64.b64encode(buf).decode('utf-8')
+    image_data_uri = f"data:image/jpeg;base64,{b64}"
+
+    # 3. Call the API
+    api_key = os.getenv("MOONDREAM_API_KEY", "")
+    headers = {
+        "Content-Type": "application/json",
+        "X-Moondream-Auth": api_key,
+    }
+    payload = {
+        "model": MOONDREAM_MODEL,
+        "image_url": image_data_uri,
+        "stream": False,
+    }
+
+    try:
+        response = httpx.post(MOONDREAM_API_URL, json=payload, headers=headers, timeout=30.0)
+        if response.status_code == 200:
+            caption = response.json().get("caption", "").strip()
+            print(f"\n✅ API Response:\n   {caption}")
+        else:
+            print(f"❌ Error {response.status_code}: {response.text}")
+    except httpx.TimeoutException:
+        print("❌ Request timed out.")
+    except Exception as e:
+        print(f"❌ Exception: {e}")
