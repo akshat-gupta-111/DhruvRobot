@@ -135,21 +135,27 @@ try:
             detected_names = []
             if known_face_encodings:
                 rgb_frame = cv2.cvtColor(raw_matrix_frame, cv2.COLOR_BGR2RGB)
-                # Scale down for faster processing
-                small_frame = cv2.resize(rgb_frame, (0, 0), fx=0.5, fy=0.5)
-                face_locations = face_recognition.face_locations(small_frame)
-                face_encs = face_recognition.face_encodings(small_frame, face_locations)
+                face_locations = face_recognition.face_locations(rgb_frame)
                 
-                for face_encoding in face_encs:
-                    matches = face_recognition.compare_faces(known_face_encodings, face_encoding, tolerance=0.55)
-                    name = "Unknown"
-                    face_distances = face_recognition.face_distance(known_face_encodings, face_encoding)
-                    if len(face_distances) > 0:
-                        best_match = np.argmin(face_distances)
-                        if matches[best_match]:
-                            name = known_face_names[best_match]
-                            if name != "Unknown" and name not in detected_names:
-                                detected_names.append(name)
+                if face_locations:
+                    print(f"\n[DEBUG] Found {len(face_locations)} face(s) in frame. Attempting recognition...")
+                    face_encs = face_recognition.face_encodings(rgb_frame, face_locations)
+                    
+                    for face_encoding in face_encs:
+                        matches = face_recognition.compare_faces(known_face_encodings, face_encoding, tolerance=0.55)
+                        face_distances = face_recognition.face_distance(known_face_encodings, face_encoding)
+                        
+                        if len(face_distances) > 0:
+                            best_match = np.argmin(face_distances)
+                            print(f"[DEBUG] Closest match distance: {face_distances[best_match]:.3f} (Tolerance is 0.55)")
+                            
+                            if matches[best_match]:
+                                name = known_face_names[best_match]
+                                print(f"[DEBUG] Successfully matched: {name}!")
+                                if name not in detected_names:
+                                    detected_names.append(name)
+                            else:
+                                print(f"[DEBUG] Face rejected (Too far from known faces).")
 
             success, compression_buffer = cv2.imencode('.jpg', raw_matrix_frame)
             if not success:
