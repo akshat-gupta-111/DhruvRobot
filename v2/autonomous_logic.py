@@ -39,6 +39,7 @@ async def evaluate_scene_agentic(history_text: str) -> AgenticResponse:
         "(what you want your wheels to do next: 'explore_closer', 'turn_left', 'turn_right', 'continue_forward', 'orbit', 'stop'). "
         "If you see an interesting object, speak about it and choose an appropriate action like 'explore_closer' or 'orbit'. "
         "If you see a dead-end or wall, say something about it and choose 'turn_left' or 'turn_right'. "
+        "If KNOWN PEOPLE IN SCENE are listed in your context, use their names and contextual details to greet them personally and tailor your conversation to them! "
         "Keep speech short and conversational. Do not use asterisks or hashtags."
     ))
     msg = HumanMessage(content=f"VISUAL HISTORY:\n{history_text}")

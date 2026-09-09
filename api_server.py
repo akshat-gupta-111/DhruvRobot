@@ -7,6 +7,7 @@ import httpx
 import pytesseract
 import edge_tts
 import urllib.parse
+import json
 from fastapi import FastAPI, File, UploadFile, Form
 import time
 import random
@@ -176,7 +177,7 @@ app = FastAPI(lifespan=lifespan)
 global_history = VisionHistory(max_seconds=15)
 
 @app.post("/autonomous")
-async def autonomous_mode(image: UploadFile = File(None)):
+async def autonomous_mode(image: UploadFile = File(None), names: str = Form(None)):
     if image is None:
         return Response(status_code=400)
         
@@ -195,6 +196,25 @@ async def autonomous_mode(image: UploadFile = File(None)):
         scene_description = await get_scene_description(b64_payload)
     
     combined_context = f"SCENE DESCRIPTION: {scene_description}"
+    
+    # Append people context if faces were recognized
+    if names:
+        try:
+            with open("people_context.json", "r") as f:
+                people_data = json.load(f)
+                
+            detected_list = names.split(",")
+            person_contexts = []
+            for name in detected_list:
+                name = name.strip()
+                if name in people_data:
+                    person_contexts.append(f"- {name}: {people_data[name]}")
+                    
+            if person_contexts:
+                combined_context += f"\n\nKNOWN PEOPLE IN SCENE:\n" + "\n".join(person_contexts)
+        except Exception as e:
+            print(f"Error loading people context: {e}")
+            
     global_history.add(combined_context)
     history_text = global_history.get_recent_history()
     

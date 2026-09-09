@@ -10,8 +10,29 @@ import platform
 import os
 import tempfile
 import numpy as np
+import face_recognition
 
 SERVER_URL = "http://127.0.0.1:8000/autonomous" # Change to Mac's IP (e.g. 192.168.x.x) when running on Jetson Nano
+
+# Load Known Faces
+known_faces_dir = "known_faces"
+known_face_encodings = []
+known_face_names = []
+
+if not os.path.exists(known_faces_dir):
+    os.makedirs(known_faces_dir)
+
+print("\n[VISION] Loading known faces for autonomous mode...")
+for filename in os.listdir(known_faces_dir):
+    if filename.lower().endswith(('.png', '.jpg', '.jpeg')):
+        filepath = os.path.join(known_faces_dir, filename)
+        image = face_recognition.load_image_file(filepath)
+        encodings = face_recognition.face_encodings(image)
+        if encodings:
+            known_face_encodings.append(encodings[0])
+            name = os.path.splitext(filename)[0].capitalize()
+            known_face_names.append(name)
+            print(f"         -> Loaded face profile: {name}")
 
 class LiveCameraStream:
     """Continuously consumes frames in a background thread to prevent buffer lag."""
@@ -110,14 +131,40 @@ try:
                 print(f"\n👀 [Vision] Safety frame (checking for dead-ends).")
 
         if is_interesting:
+            # Face Recognition (Run ONLY when sending an interesting frame to save CPU)
+            detected_names = []
+            if known_face_encodings:
+                rgb_frame = cv2.cvtColor(raw_matrix_frame, cv2.COLOR_BGR2RGB)
+                # Scale down for faster processing
+                small_frame = cv2.resize(rgb_frame, (0, 0), fx=0.5, fy=0.5)
+                face_locations = face_recognition.face_locations(small_frame)
+                face_encs = face_recognition.face_encodings(small_frame, face_locations)
+                
+                for face_encoding in face_encs:
+                    matches = face_recognition.compare_faces(known_face_encodings, face_encoding, tolerance=0.55)
+                    name = "Unknown"
+                    face_distances = face_recognition.face_distance(known_face_encodings, face_encoding)
+                    if len(face_distances) > 0:
+                        best_match = np.argmin(face_distances)
+                        if matches[best_match]:
+                            name = known_face_names[best_match]
+                            if name != "Unknown" and name not in detected_names:
+                                detected_names.append(name)
+
             success, compression_buffer = cv2.imencode('.jpg', raw_matrix_frame)
             if not success:
                 continue
                 
             try:
+                payload_data = {}
+                if detected_names:
+                    payload_data["names"] = ",".join(detected_names)
+                    print(f"\n👀 [Vision] Recognized known person(s): {payload_data['names']}")
+
                 # Send to Mac Brain (Loop B)
                 response = requests.post(
                     SERVER_URL, 
+                    data=payload_data,
                     files={"image": ("frame.jpg", compression_buffer.tobytes(), "image/jpeg")},
                     timeout=60
                 )
