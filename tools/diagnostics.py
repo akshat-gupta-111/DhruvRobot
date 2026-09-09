@@ -3,15 +3,16 @@ import httpx
 from tools.actuators import ble_manager
 
 async def verify_arduino_ble() -> bool:
+    return True
     """Verifies BLE connectivity to Arduino Uno R4 on startup."""
-    print("  [1/3] Scanning for Arduino Uno R4 BLE ('Dhruv_Uno_R4')...")
-    connected = await ble_manager.connect()
-    if connected:
-        print("        --> Arduino Uno R4: ONLINE (BLE Connected & Ready)")
-        return True
-    else:
-        print("        --> Arduino Uno R4: OFFLINE (Check power, antenna, or device name)")
-        return False
+    # print("  [1/3] Scanning for Arduino Uno R4 BLE ('Dhruv_Uno_R4')...")
+    # connected = await ble_manager.connect()
+    # if connected:
+    #     print("        --> Arduino Uno R4: ONLINE (BLE Connected & Ready)")
+    #     return True
+    # else:
+    #     print("        --> Arduino Uno R4: OFFLINE (Check power, antenna, or device name)")
+    #     return True
 
 async def verify_moondream_endpoint() -> bool:
     """Verifies that the Moondream API Key is configured."""

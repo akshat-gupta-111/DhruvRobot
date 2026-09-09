@@ -28,22 +28,26 @@ def extract_text_locally(frame):
     except Exception as e:
         return f"OCR Error: {e}"
 
-async def capture_and_analyze(shared_memory: dict, stop_event=None):
+async def capture_and_analyze(shared_memory: dict, stop_event=None, runner: str = "kaggle"):
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         shared_memory["current_scene"] = "Vision Error: Camera not accessible."
         return
 
     api_key = os.getenv("MOONDREAM_API_KEY", "")
-
     network_headers = {
         "Content-Type": "application/json",
         "X-Moondream-Auth": api_key,
         "User-Agent": "DhruvVisionAgent/2.0"
     }
+    
+    base_url = os.getenv("NGROK_BASE_URL", "").rstrip('/')
 
     print("👁️ Dhruv's dual-pipeline vision (Scene + OCR) activated.")
-    print(f"   └─ Using Moondream Cloud API → {MOONDREAM_API_URL}")
+    if runner == "kaggle":
+        print(f"   └─ Using Kaggle Cloud API via Ngrok → {base_url}")
+    else:
+        print(f"   └─ Using Moondream Cloud API → {MOONDREAM_API_URL}")
 
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -63,25 +67,40 @@ async def capture_and_analyze(shared_memory: dict, stop_event=None):
                 if not base64_payload_string:
                     continue
 
-                # Moondream Cloud API expects a data-URI for the image
-                image_data_uri = f"data:image/jpeg;base64,{base64_payload_string}"
-
-                payload = {
-                    "model": MOONDREAM_MODEL,
-                    "image_url": image_data_uri,
-                    "stream": False
-                }
+                # Prepare payload based on the runner
+                if runner == "kaggle":
+                    target_endpoint = f"{base_url}/api/generate"
+                    payload = {
+                        "model": "moondream",
+                        "prompt": "Describe the current scene, objects, and people. Do not attempt to read text.",
+                        "stream": False,
+                        "images": [base64_payload_string]
+                    }
+                    req_kwargs = {"url": target_endpoint, "json": payload}
+                else:
+                    # Moondream Cloud API expects a data-URI for the image
+                    image_data_uri = f"data:image/jpeg;base64,{base64_payload_string}"
+                    payload = {
+                        "model": MOONDREAM_MODEL,
+                        "image_url": image_data_uri,
+                        "stream": False
+                    }
+                    req_kwargs = {"url": MOONDREAM_API_URL, "json": payload, "headers": network_headers}
 
                 try:
                     ocr_task = asyncio.to_thread(extract_text_locally, raw_matrix_frame)
-                    api_task = client.post(MOONDREAM_API_URL, json=payload, headers=network_headers)
+                    api_task = client.post(**req_kwargs)
 
                     ocr_text, response = await asyncio.gather(ocr_task, api_task)
                     
                     scene_description = "Scene unavailable."
                     if response.status_code == 200:
-                        # Moondream Cloud API returns {"caption": "..."}
-                        scene_description = response.json().get("caption", "").strip()
+                        if runner == "kaggle":
+                            # Kaggle endpoint uses 'response'
+                            scene_description = response.json().get("response", "").strip()
+                        else:
+                            # Official API uses 'caption'
+                            scene_description = response.json().get("caption", "").strip()
                     else:
                         scene_description = f"API Error {response.status_code}: {response.text[:120]}"
                     
@@ -93,7 +112,7 @@ async def capture_and_analyze(shared_memory: dict, stop_event=None):
                     shared_memory["current_scene"] = combined_context.strip()
                         
                 except httpx.TimeoutException:
-                    shared_memory["current_scene"] = "Vision lagging: Moondream Cloud API timed out."
+                    shared_memory["current_scene"] = f"Vision lagging: {'Kaggle' if runner == 'kaggle' else 'Moondream Cloud'} API timed out."
                 except Exception as e:
                     shared_memory["current_scene"] = f"Vision offline: {str(e)}"
 
