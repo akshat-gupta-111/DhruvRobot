@@ -82,6 +82,8 @@ AZURE_OPENAI_ENDPOINT = (os.getenv("AZURE_OPENAI_ENDPOINT") or os.getenv("AZURE_
 AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY") or os.getenv("AZURE_API_KEY") or ""
 AZURE_DEPLOYMENT = os.getenv("AZURE_DEPLOYMENT") or os.getenv("AZURE_MODEL") or "gpt-4o"
 AZURE_API_VERSION = os.getenv("AZURE_API_VERSION", "2025-01-01-preview")
+# Max retries on transient DNS / connection errors (Errno -2, timeout, reset)
+AZURE_MAX_RETRIES = int(os.getenv("AZURE_MAX_RETRIES", "3"))
 
 # Global lock to prevent microphone from picking up Dhruv's own speech
 is_dhruv_speaking = False
@@ -439,43 +441,45 @@ class DhruvBrainEngine:
         return ""
 
     async def generate_exploration_observation(self, client: httpx.AsyncClient, scene_desc: str, ocr_text: str = "", figure_context_str: str = "") -> str:
-        """Generates a lively, natural observation about the surroundings in exploration mode."""
-        past_str = "\n".join([f"- {obs}" for obs in self.past_observations[-3:]]) if self.past_observations else "None yet."
+        """Generates a lively, concise observation about the surroundings in exploration mode."""
+        past_str = "; ".join(self.past_observations[-2:]) if self.past_observations else "none"
 
-        prompt = f"""You are Dhruv, an intelligent living robotic entity exploring your physical environment.
+        # Build KNOWN PEOPLE block explicitly so the LLM MUST use it
+        known_people_block = ""
+        if figure_context_str and figure_context_str.strip() and figure_context_str != "No human faces detected in current frame.":
+            known_people_block = f"""
+=== KNOWN PEOPLE DETECTED (YOU MUST USE THIS!) ===
+{figure_context_str}
+=== END KNOWN PEOPLE ==="""
 
-CURRENT SENSORY INPUT:
+        prompt = f"""You are Dhruv, a curious robotic companion exploring your surroundings.
 Scene: {scene_desc}
-Recognized People / Figures: {figure_context_str if figure_context_str else 'None'}
-Visible Text: {ocr_text if ocr_text else 'None'}
+Visible Text: {ocr_text if ocr_text else 'none'}
+Recent observations (do NOT repeat these): {past_str}
+{known_people_block}
 
-Previous observations you already shared:
-{past_str}
-
-Guidelines for this observation:
-1. Speak a single, natural 1-2 sentence spoken observation about what you notice right now.
-2. If a RECOGNIZED PERSON or FIGURE is in view, prioritize acknowledging them personally using their biographical context! Tailor your interaction (e.g., greet your creator/mentor warmly and mention their work or passion).
-3. CRITICAL: If you already greeted this person in recent observations, DO NOT keep repeating the greeting; instead, comment on what they are doing, their hand gestures (e.g. fingers held up), or the surrounding scene.
-4. Focus on an interesting detail, object, person, activity, or subtle change.
-5. Sound lively, observant, and curious.
-6. Do NOT repeat the exact sentences or ideas from previous observations.
-7. Do not use emojis or bullet points."""
+RULES:
+- Respond with ONE spoken sentence (max 20 words).
+- If KNOWN PEOPLE DETECTED block is present above, you MUST address that person by name and reference their biography (e.g. their role, passion, or relationship to Dhruv).
+- If you already greeted them recently, skip the greeting — comment on what they are doing or their gesture instead.
+- If no known people, make a curious observation about the scene.
+- No emojis. No bullets. Natural speech only."""
 
         messages = [
             {"role": "system", "content": prompt},
-            {"role": "user", "content": "What do you notice around you right now?"}
+            {"role": "user", "content": "Speak your observation now."}
         ]
 
-        obs = await self.query_azure_llm(client, messages, temperature=0.7, max_tokens=150)
+        obs = await self.query_azure_llm(client, messages, temperature=0.75, max_tokens=80)
         obs = clean_for_speech_and_display(obs)
         if obs:
             self.past_observations.append(obs)
-            if len(self.past_observations) > 8:
+            if len(self.past_observations) > 6:
                 self.past_observations.pop(0)
         return obs
 
     async def query_azure_llm(self, client: httpx.AsyncClient, messages: List[Dict[str, str]], temperature: float = 0.3, max_tokens: int = 300) -> str:
-        """Queries Azure OpenAI / AI Foundry endpoint with messages."""
+        """Queries Azure OpenAI with automatic retry on transient DNS/connection errors."""
         if "/chat/completions" in AZURE_OPENAI_ENDPOINT:
             url = AZURE_OPENAI_ENDPOINT
         elif "/deployments/" in AZURE_OPENAI_ENDPOINT:
@@ -495,39 +499,64 @@ Guidelines for this observation:
             "max_tokens": max_tokens
         }
 
-        try:
-            res = await client.post(url, json=payload, headers=headers, timeout=35.0)
-            if res.status_code == 200:
-                data = res.json()
-                choices = data.get("choices", [])
-                if choices:
-                    return choices[0].get("message", {}).get("content", "").strip()
-                return "Azure returned an empty response."
-            else:
-                return f"Azure API Error: HTTP {res.status_code} - {res.text[:120]}"
-        except Exception as e:
-            return f"Azure Connection Error: {e}"
+        last_error = None
+        for attempt in range(1, AZURE_MAX_RETRIES + 1):
+            try:
+                res = await client.post(url, json=payload, headers=headers, timeout=25.0)
+                if res.status_code == 200:
+                    data = res.json()
+                    choices = data.get("choices", [])
+                    if choices:
+                        return choices[0].get("message", {}).get("content", "").strip()
+                    return "Azure returned an empty response."
+                elif res.status_code in (429, 503):
+                    # Rate limit or service unavailable → wait and retry
+                    wait = 2 ** attempt
+                    print(f"[Azure Retry]: HTTP {res.status_code}, retrying in {wait}s (attempt {attempt}/{AZURE_MAX_RETRIES})...")
+                    await asyncio.sleep(wait)
+                    last_error = f"HTTP {res.status_code}"
+                    continue
+                else:
+                    return f"Azure API Error: HTTP {res.status_code} - {res.text[:120]}"
+            except (httpx.ConnectError, httpx.RemoteProtocolError,
+                    httpx.ReadTimeout, httpx.ConnectTimeout,
+                    OSError) as e:
+                # Errno -2 (Name not known), connection reset, timeout
+                last_error = str(e)
+                wait = 1.5 ** attempt
+                print(f"[Azure Retry]: Transient error (attempt {attempt}/{AZURE_MAX_RETRIES}): {type(e).__name__} - retrying in {wait:.1f}s")
+                await asyncio.sleep(wait)
+            except Exception as e:
+                return f"Azure Connection Error: {e}"
+
+        return f"Azure Connection Error: Failed after {AZURE_MAX_RETRIES} retries. Last error: {last_error}"
 
     async def execute_command(self, client: httpx.AsyncClient, frame, user_query: str, ocr_text: str = "", figure_context_str: str = "") -> str:
-        """Executes user command with full LangGraph persona, visual awareness, and person context."""
+        """Executes user command with visual awareness and mandatory person context."""
         if frame is not None:
             await self.get_scene_caption(client, frame, ocr_text, figure_context_str)
 
-        human_ctx = f"\nPEOPLE / FIGURES PRESENT:\n{figure_context_str}" if figure_context_str else ""
+        # Build a strongly-worded known-people block so the model CANNOT ignore it
+        known_people_block = ""
+        if figure_context_str and figure_context_str.strip() and figure_context_str != "No human faces detected in current frame.":
+            known_people_block = f"""
 
-        system_prompt = f"""You are Dhruv, an intelligent, living robotic companion.
-You can 'see' your environment through a multi-modal vision system providing scene descriptions, facial recognition with known identity profiles, hand gesture tracking, and raw OCR text.
+=== IDENTITY OF PERSON IN FRONT OF YOU (MANDATORY - USE THIS IN YOUR RESPONSE) ===
+{figure_context_str}
+=== END IDENTITY ==="""
 
-CURRENT VISUAL & HUMAN CONTEXT:
-{self.last_visual_context}{human_ctx}
+        system_prompt = f"""You are Dhruv, an intelligent living robotic companion built by a team of robotics enthusiasts.
+You perceive the world through scene vision (Moondream VLM), facial recognition, hand gesture tracking, and OCR.
 
-Guidelines for responding:
-1. If a known person is detected in front of you, you know exactly who you are speaking to! Use their profile and background from the context to personalize your response, greeting, and relationship.
-2. If the user asks what you see, who is in front of you, or asks about hand gestures/fingers, synthesize the SCENE DESCRIPTION, RECOGNIZED PEOPLE, and HAND GESTURES naturally.
-3. The VISIBLE TEXT DETECTED might contain typos or fragmented words (raw OCR data). Use your intelligence to infer what the text actually says based on the scene context.
-4. If the user asks you to read something, quote the text from the VISIBLE TEXT section.
-5. If the user asks a general question, answer it directly and intelligently using your broad knowledge.
-6. Respond conversationally in 1-3 spoken sentences. Dont use emojis."""
+CURRENT SENSORY CONTEXT:
+{self.last_visual_context}{known_people_block}
+
+CRITICAL RULES:
+1. If the IDENTITY block is present above, you ABSOLUTELY MUST acknowledge that person by name and use their biographical details in your answer. Treat them as someone you know personally.
+2. For vision/scene questions: describe what you see using the SCENE DESCRIPTION above.
+3. For OCR questions: quote from VISIBLE TEXT DETECTED (correct obvious OCR typos using context).
+4. For general knowledge questions: answer directly from your training knowledge.
+5. Keep replies conversational, 1-3 sentences, no emojis, no markdown."""
 
         messages = [{"role": "system", "content": system_prompt}]
         messages.extend(self.history[-6:])
@@ -615,9 +644,11 @@ async def run_dhruv(trigger_requested: bool = False):
     voice_listener = WakeWordListener(on_wake_triggered)
     voice_listener.start()
 
-    async with httpx.AsyncClient(timeout=45.0) as client:
+    # Persistent client with connection limits to avoid DNS re-resolution every request
+    limits = httpx.Limits(max_connections=4, max_keepalive_connections=2)
+    async with httpx.AsyncClient(timeout=25.0, limits=limits) as client:
         # Initial greeting
-        start_msg = "Dhruv online. Entering exploration mode. Say 'Listen Dhruv!' anytime to give me a command."
+        start_msg = "Dhruv online. Entering exploration mode. Say 'Listen Dhruv' anytime to give me a command."
         print(f"Dhruv: {start_msg}\n")
         if AUDIO_ENABLED:
             await speak_text(start_msg)
@@ -628,6 +659,7 @@ async def run_dhruv(trigger_requested: bool = False):
                 # STATE A: EXPLORATION MODE (Active until wake word triggered)
                 # =========================================================
                 if not wake_event.is_set():
+                    t_cycle_start = time.time()
                     print("🔭 [Exploration Mode]: Analyzing surroundings...")
                     frame = None
                     ocr_text = ""
@@ -636,35 +668,60 @@ async def run_dhruv(trigger_requested: bool = False):
                     grabbed, raw_frame = cam.read()
                     if grabbed and raw_frame is not None:
                         frame = raw_frame
-                        ocr_text = extract_text_locally(frame)
-                        if vision_engine is not None:
-                            try:
-                                fingers, names, contexts, figure_context_str, _ = vision_engine.process_frame(frame)
-                                recognized_known = [n for n in names if n != "Unknown"]
-                                if recognized_known:
-                                    print(f"👤 [Spotted Known Figure]: {', '.join(recognized_known)}")
-                                    for rk in recognized_known:
-                                        if rk in contexts:
-                                            print(f"   📖 [Bio]: {contexts[rk]}")
-                                if fingers > 0:
-                                    print(f"   🖐️ [Gestures]: {fingers} fingers held up")
-                            except Exception as e:
-                                print(f"[Face Recognition Warning]: {e}")
 
-                    # Get scene description from Moondream on Kaggle GPU
-                    scene_desc = await brain.get_scene_caption(client, frame, ocr_text, figure_context_str)
+                    # Run face recognition + OCR concurrently (both are CPU-only, no I/O wait)
+                    async def _run_face_and_ocr():
+                        nonlocal ocr_text, figure_context_str
+                        if frame is None:
+                            return
+                        # OCR in thread (blocking CPU)
+                        ocr_fut = asyncio.to_thread(extract_text_locally, frame)
+                        # Face recognition in thread (blocking CPU)
+                        async def _face_recog():
+                            nonlocal figure_context_str
+                            if vision_engine is not None:
+                                try:
+                                    fingers, names, contexts, figure_context_str, _ = await asyncio.to_thread(
+                                        vision_engine.process_frame, frame
+                                    )
+                                    recognized_known = [n for n in names if n != "Unknown"]
+                                    if recognized_known:
+                                        print(f"👤 [Spotted]: {', '.join(recognized_known)}")
+                                        for rk in recognized_known:
+                                            if rk in contexts:
+                                                print(f"   📖 [Bio]: {contexts[rk][:80]}...")
+                                    if fingers > 0:
+                                        print(f"   🖐️ [Gesture]: {fingers} fingers")
+                                except Exception as e:
+                                    print(f"[Face Warning]: {e}")
+
+                        ocr_result, _ = await asyncio.gather(ocr_fut, _face_recog())
+                        ocr_text = ocr_result or ""
+
+                    # Run both face+OCR concurrently with Moondream scene caption
+                    scene_desc, _ = await asyncio.gather(
+                        brain.get_scene_caption(client, frame, ocr_text, figure_context_str),
+                        _run_face_and_ocr()
+                    )
+                    # After gather, rebuild scene context with updated figure_context_str
+                    if scene_desc and figure_context_str:
+                        brain.last_visual_context = (
+                            f"SCENE DESCRIPTION: {scene_desc}\n"
+                            f"PEOPLE & FIGURES IN SCENE: {figure_context_str}\n"
+                            f"VISIBLE TEXT DETECTED: {ocr_text if ocr_text else 'No legible text found.'}"
+                        )
 
                     if scene_desc and not wake_event.is_set():
-                        # Generate a fresh 1-2 sentence lively observation
                         observation = await brain.generate_exploration_observation(client, scene_desc, ocr_text, figure_context_str)
                         if observation and not wake_event.is_set():
-                            print(f"\n🔭 Dhruv Observes: \"{observation}\"\n")
+                            dt = time.time() - t_cycle_start
+                            print(f"\n🔭 Dhruv Observes ({dt:.1f}s): \"{observation}\"\n")
                             if AUDIO_ENABLED:
                                 await speak_text(observation)
 
-                    # Pause between exploration cycles (8 seconds), but wake immediately if user speaks
+                    # 5s between cycles (down from 8s); wake immediately on voice
                     try:
-                        await asyncio.wait_for(wake_event.wait(), timeout=8.0)
+                        await asyncio.wait_for(wake_event.wait(), timeout=5.0)
                     except asyncio.TimeoutError:
                         pass
 
