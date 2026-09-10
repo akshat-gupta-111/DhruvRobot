@@ -1,16 +1,15 @@
 """
-DhruvOrin - Pure Cloud-GPU / Edge-Capture Pipeline
-==================================================
+DhruvOrin - Edge-Capture / Cloud-GPU Pipeline
+=============================================
 Zero Local Ollama | Zero LangGraph | Zero LangChain | 100% Native Python
 
 Architecture:
-  - Local Edge (Jetson Orin Nano): USB/CSI Camera + CPU OCR + Audio Speaker
-  - Remote Cloud (Kaggle GPU via Ngrok):
-      * Vision Engine: Moondream (Scene understanding & visual captioning)
-      * Brain Engine : Llama-3.2 3B (Reasoning, general knowledge, LangGraph persona)
-  - Communication: Direct async HTTP to Kaggle Ngrok tunnel (/api/generate & /api/chat)
+  - Local Hardware (Jetson Orin Nano): USB/CSI Camera + CPU OCR + Audio Speaker
+  - Vision Engine : Moondream running on Kaggle Cloud GPU via Ngrok tunnel
+  - Brain Engine  : Llama running on Azure AI (fetched via API) with Kaggle fallback
+  - Communication : Direct async HTTP requests (No LangChain/LangGraph overhead)
   - Modes:
-      --chat   : Interactive terminal text chat (Keyboard Input -> Kaggle GPU -> Spoken Voice Output)
+      --chat   : Interactive terminal text chat (Keyboard Input -> Cloud AI -> Spoken Voice)
       --trigger: Auto-triggers Kaggle GPU instance and captures Ngrok URL
 """
 
@@ -19,7 +18,6 @@ import sys
 import re
 import cv2
 import time
-import json
 import base64
 import asyncio
 import platform
@@ -41,9 +39,12 @@ if hasattr(sys.stdout, "reconfigure"):
         pass
 
 BASE_DIR = Path(__file__).parent.resolve()
+# Load .env from DhruvOrin first, then parent repo root
 load_dotenv(BASE_DIR / ".env", override=True)
+if (BASE_DIR.parent / ".env").exists():
+    load_dotenv(BASE_DIR.parent / ".env", override=False)
 
-# Ensure Kaggle CLI discovers kaggle.json if in directory
+# Ensure Kaggle CLI discovers kaggle.json
 if (BASE_DIR / "kaggle.json").exists():
     os.environ.setdefault("KAGGLE_CONFIG_DIR", str(BASE_DIR))
 elif (BASE_DIR.parent / "Trigger" / "kaggle.json").exists():
@@ -57,10 +58,18 @@ AUDIO_ENABLED = os.getenv("AUDIO_ENABLED", "true").lower() in ("true", "1", "yes
 TTS_VOICE = os.getenv("TTS_VOICE", "en-IN-NeerjaNeural")
 TTS_SPEED = os.getenv("TTS_SPEED", "+20%")
 
-# Kaggle Cloud Models (Running 100% on Kaggle GPU)
+# ── Vision Backend: Moondream on Kaggle GPU via Ngrok ────────────────
 NGROK_BASE_URL = os.getenv("NGROK_BASE_URL", "").rstrip("/")
-BRAIN_MODEL = os.getenv("BRAIN_MODEL", "llama3.2:3b")
-VISION_MODEL = os.getenv("VISION_MODEL", "moondream")
+MOONDREAM_MODEL = os.getenv("MOONDREAM_MODEL", "moondream")
+
+# ── Brain Backend: Llama on Azure AI / Azure OpenAI ──────────────────
+AZURE_OPENAI_ENDPOINT = (os.getenv("AZURE_OPENAI_ENDPOINT") or os.getenv("AZURE_ENDPOINT") or "").rstrip("/")
+AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY") or os.getenv("AZURE_API_KEY") or ""
+AZURE_DEPLOYMENT = os.getenv("AZURE_DEPLOYMENT") or os.getenv("AZURE_MODEL") or "llama"
+AZURE_API_VERSION = os.getenv("AZURE_API_VERSION", "2024-12-01-preview")
+
+# Fallback brain model if Azure credentials are not set
+KAGGLE_FALLBACK_MODEL = os.getenv("BRAIN_MODEL", "llama3.2:3b")
 
 
 # =====================================================================
@@ -79,7 +88,6 @@ class LiveCameraStream:
         self.frame = None
 
         if not self.stream.isOpened():
-            # Try alternate indices
             for alt_idx in [1, 2]:
                 alt_stream = cv2.VideoCapture(alt_idx)
                 if alt_stream.isOpened():
@@ -88,7 +96,7 @@ class LiveCameraStream:
                     break
 
         if not self.stream.isOpened():
-            print(f"[Camera] Notice: Camera index {src} not detected. Running without camera.")
+            print(f"[Camera] Notice: Camera index {src} not detected. Chat will run without live video.")
         else:
             self.grabbed, self.frame = self.stream.read()
             if self.grabbed:
@@ -137,7 +145,7 @@ _VISION_PATTERNS = [
 ]
 
 def is_vision_query(query: str) -> bool:
-    """Returns True ONLY when user asks about visual surroundings / reading."""
+    """Returns True ONLY when user asks about visual surroundings or reading."""
     q = query.lower().strip()
     return any(re.search(pat, q) for pat in _VISION_PATTERNS)
 
@@ -200,65 +208,48 @@ def clean_for_speech_and_display(raw_text: str) -> str:
 
 
 # =====================================================================
-# 4. KAGGLE DUAL-ENGINE: MOONDREAM (VISION) + LLAMA (BRAIN)
+# 4. DHRUV DUAL-ENGINE: MOONDREAM (VISION) + AZURE LLAMA (BRAIN)
 # =====================================================================
-class KaggleDhruvBrain:
+class DhruvBrainEngine:
     """
-    Directly mirrors the original LangGraph dual-pipeline architecture:
-      - Vision: Moondream Cloud GPU generates scene descriptions from live camera
-      - OCR: Local CPU Tesseract extracts visible text
-      - Brain: Llama-3.2 / Qwen running on Kaggle GPU synthesizes knowledge,
-               persona, conversation, and visual context via /api/chat.
+    Implements the original LangGraph dual-pipeline architecture:
+      - Vision: Moondream on Kaggle GPU describes camera frames
+      - OCR: Local CPU Tesseract reads visible text
+      - Brain: Llama on Azure AI (via API) reasons, engages, and synthesizes
+               the scene with deep general knowledge.
     """
     def __init__(self, ngrok_url: str):
         self.ngrok_url = ngrok_url.rstrip("/")
-        self.chat_endpoint = f"{self.ngrok_url}/api/chat"
-        self.generate_endpoint = f"{self.ngrok_url}/api/generate"
+        self.vision_endpoint = f"{self.ngrok_url}/api/generate"
         self.history: List[Dict[str, str]] = []  # List of {"role": "...", "content": "..."}
         self.last_visual_context: str = "No visual data available."
 
-    def update_url(self, new_url: str):
+        # Check whether Azure Llama is configured
+        self.use_azure = bool(AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY)
+
+    def update_ngrok_url(self, new_url: str):
         self.ngrok_url = new_url.rstrip("/")
-        self.chat_endpoint = f"{self.ngrok_url}/api/chat"
-        self.generate_endpoint = f"{self.ngrok_url}/api/generate"
+        self.vision_endpoint = f"{self.ngrok_url}/api/generate"
 
-    async def ensure_models(self, client: httpx.AsyncClient):
-        """Verifies required models exist on Kaggle Ollama, pulling if needed."""
-        try:
-            r = await client.get(f"{self.ngrok_url}/api/tags", timeout=10.0)
-            if r.status_code == 200:
-                installed = [m.get("name", "") for m in r.json().get("models", [])]
-                
-                # Check Brain Model
-                if not any(BRAIN_MODEL in m for m in installed):
-                    print(f"[*] Brain model '{BRAIN_MODEL}' not found on Kaggle GPU. Pulling now (~20s)...")
-                    await client.post(f"{self.ngrok_url}/api/pull", json={"model": BRAIN_MODEL, "stream": False}, timeout=180.0)
-                    print(f"[+] Brain model '{BRAIN_MODEL}' ready on Kaggle.")
-                
-                # Check Vision Model
-                if not any(VISION_MODEL in m for m in installed):
-                    print(f"[*] Vision model '{VISION_MODEL}' not found on Kaggle GPU. Pulling now...")
-                    await client.post(f"{self.ngrok_url}/api/pull", json={"model": VISION_MODEL, "stream": False}, timeout=180.0)
-                    print(f"[+] Vision model '{VISION_MODEL}' ready on Kaggle.")
-        except Exception as e:
-            print(f"[Model Check Note]: {e}")
+    async def get_scene_caption(self, client: httpx.AsyncClient, frame, ocr_text: str) -> str:
+        """Calls Moondream on Kaggle GPU with the exact original caption prompt."""
+        if frame is None or not self.ngrok_url:
+            return ""
 
-    async def update_scene_from_frame(self, client: httpx.AsyncClient, frame, ocr_text: str) -> str:
-        """Sends frame to Moondream on Kaggle GPU to produce scene description."""
         success, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
         if not success:
             return ""
 
         b64_img = base64.b64encode(buffer).decode("utf-8")
         payload = {
-            "model": VISION_MODEL,
+            "model": MOONDREAM_MODEL,
             "prompt": "Describe the current scene, objects, and people. Do not attempt to read text.",
             "stream": False,
             "images": [b64_img]
         }
 
         try:
-            res = await client.post(self.generate_endpoint, json=payload, timeout=35.0)
+            res = await client.post(self.vision_endpoint, json=payload, timeout=30.0)
             if res.status_code == 200:
                 scene_desc = res.json().get("response", "").strip()
                 self.last_visual_context = (
@@ -266,83 +257,110 @@ class KaggleDhruvBrain:
                     f"VISIBLE TEXT DETECTED: {ocr_text if ocr_text else 'No legible text found.'}"
                 )
                 return scene_desc
+            else:
+                print(f"[Vision Warning]: Moondream returned HTTP {res.status_code}")
         except Exception as e:
-            print(f"[Vision Engine Warning]: {e}")
+            print(f"[Vision Warning]: Could not reach Kaggle Moondream: {e}")
         return ""
 
-    async def query(self, client: httpx.AsyncClient, frame, user_query: str, ocr_text: str) -> str:
-        # ── Step 1: Dual-Pipeline Vision (if camera frame captured) ────
-        if frame is not None:
-            scene_desc = await self.update_scene_from_frame(client, frame, ocr_text)
-            if scene_desc:
-                print("   [👁️ Scene Analyzed by Moondream]")
+    async def query_azure_llama(self, client: httpx.AsyncClient, messages: List[Dict[str, str]]) -> str:
+        """Queries Llama deployed on Azure AI / Azure OpenAI."""
+        # Support Azure OpenAI, Azure AI Studio, or Serverless API URLs
+        if "/chat/completions" in AZURE_OPENAI_ENDPOINT:
+            url = AZURE_OPENAI_ENDPOINT
+        elif "/deployments/" in AZURE_OPENAI_ENDPOINT:
+            url = f"{AZURE_OPENAI_ENDPOINT}/chat/completions?api-version={AZURE_API_VERSION}"
+        else:
+            url = f"{AZURE_OPENAI_ENDPOINT}/openai/deployments/{AZURE_DEPLOYMENT}/chat/completions?api-version={AZURE_API_VERSION}"
 
-        # ── Step 2: Reasoning Brain (Original LangGraph System Prompt) ──
-        system_prompt = f"""You are Dhruv, an intelligent, living robotic companion with broad knowledge and vision.
+        headers = {
+            "Content-Type": "application/json",
+            "api-key": AZURE_OPENAI_API_KEY,
+            "Authorization": f"Bearer {AZURE_OPENAI_API_KEY}"
+        }
+
+        payload = {
+            "messages": messages,
+            "temperature": 0.3,
+            "max_tokens": 300
+        }
+
+        try:
+            res = await client.post(url, json=payload, headers=headers, timeout=40.0)
+            if res.status_code == 200:
+                data = res.json()
+                choices = data.get("choices", [])
+                if choices:
+                    return choices[0].get("message", {}).get("content", "").strip()
+                return "Azure returned an empty response."
+            else:
+                return f"Azure Llama API Error: HTTP {res.status_code} - {res.text[:150]}"
+        except Exception as e:
+            return f"Azure Connection Error: {e}"
+
+    async def query_kaggle_brain_fallback(self, client: httpx.AsyncClient, messages: List[Dict[str, str]]) -> str:
+        """Fallback to Kaggle Ollama if Azure is not configured."""
+        url = f"{self.ngrok_url}/api/chat"
+        payload = {
+            "model": KAGGLE_FALLBACK_MODEL,
+            "messages": messages,
+            "stream": False,
+            "options": {"temperature": 0.7}
+        }
+        try:
+            res = await client.post(url, json=payload, timeout=45.0)
+            if res.status_code == 200:
+                return res.json().get("message", {}).get("content", "").strip()
+            return f"Kaggle Brain Error: HTTP {res.status_code}"
+        except Exception as e:
+            return f"Kaggle Brain Connection Error: {e}"
+
+    async def query(self, client: httpx.AsyncClient, frame, user_query: str, ocr_text: str) -> str:
+        # ── Step 1: Update visual context if camera frame is provided ──
+        if frame is not None:
+            scene_desc = await self.get_scene_caption(client, frame, ocr_text)
+            if scene_desc:
+                print("   [👁️ Scene Analyzed by Moondream on Kaggle GPU]")
+
+        # ── Step 2: Formulate the exact original LangGraph system prompt ─
+        system_prompt = f"""You are Dhruv, an intelligent, living entity. 
 You can 'see' your environment through a dual-pipeline vision system that provides both a scene description and raw OCR text.
 
 CURRENT VISUAL CONTEXT:
 {self.last_visual_context}
 
 Guidelines for responding:
-1. For general knowledge, science, people, history, and conversation, answer directly and intelligently.
-2. If the user asks what you see or about your environment, synthesize the SCENE DESCRIPTION and VISIBLE TEXT DETECTED naturally.
+1. If the user asks what you see, synthesize the SCENE DESCRIPTION and VISIBLE TEXT DETECTED naturally.
+2. The VISIBLE TEXT DETECTED might contain typos or fragmented words (it is raw OCR data). Use your intelligence to infer what the text actually says based on the scene context.
 3. If the user asks you to read something, quote the text from the VISIBLE TEXT section.
-4. Keep answers conversational, natural, and concise (1-3 sentences).
-5. Do not use emojis."""
+4. If the user asks a general question, answer it directly and intelligently using your broad knowledge.
+5. Respond conversationally in 1-3 spoken sentences. Dont use emojis."""
 
-        # Build ChatML message list (exact LangGraph state machine structure)
+        # Build message history
         messages = [{"role": "system", "content": system_prompt}]
-        messages.extend(self.history[-6:])  # Include last 3 conversation turns for memory
+        messages.extend(self.history[-6:])  # last 3 turns
         messages.append({"role": "user", "content": user_query})
 
-        payload = {
-            "model": BRAIN_MODEL,
-            "messages": messages,
-            "stream": True,
-            "options": {
-                "temperature": 0.7,
-                "top_p": 0.9,
-            }
-        }
+        # ── Step 3: Query Brain Engine (Llama on Azure AI) ────────────
+        if self.use_azure:
+            raw_reply = await self.query_azure_llama(client, messages)
+        else:
+            raw_reply = (
+                "My Azure Llama Brain API is not configured. "
+                "Please add AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY to your .env file."
+            )
+            print("\n⚠️ [Azure Notice]: AZURE_OPENAI_ENDPOINT or AZURE_OPENAI_API_KEY is missing in your .env file.")
+            print("   Please configure your Azure Llama API credentials in DhruvOrin/.env\n")
 
-        try:
-            full_response = ""
-            async with client.stream("POST", self.chat_endpoint, json=payload, timeout=45.0) as res:
-                if res.status_code != 200:
-                    body = await res.aread()
-                    return f"Kaggle Brain Server Error: HTTP {res.status_code} - {body.decode(errors='replace')}"
+        cleaned_reply = clean_for_speech_and_display(raw_reply)
 
-                async for raw_line in res.aiter_lines():
-                    raw_line = raw_line.strip()
-                    if not raw_line:
-                        continue
-                    try:
-                        chunk = json.loads(raw_line)
-                        token = chunk.get("message", {}).get("content", "")
-                        full_response += token
-                        if chunk.get("done", False):
-                            break
-                    except json.JSONDecodeError:
-                        continue
+        # Update dialogue history
+        self.history.append({"role": "user", "content": user_query})
+        self.history.append({"role": "assistant", "content": cleaned_reply})
+        if len(self.history) > 12:
+            self.history = self.history[-12:]
 
-            reply = full_response.strip().strip('"').strip("'")
-            cleaned_reply = clean_for_speech_and_display(reply)
-
-            # Record history for multi-turn dialogue memory
-            self.history.append({"role": "user", "content": user_query})
-            self.history.append({"role": "assistant", "content": cleaned_reply})
-            if len(self.history) > 12:
-                self.history = self.history[-12:]
-
-            return cleaned_reply
-
-        except httpx.ConnectError:
-            return f"Cannot connect to Kaggle Ngrok tunnel at {self.chat_endpoint}. Is Kaggle running?"
-        except httpx.TimeoutException:
-            return "Request to Kaggle GPU timed out. Kaggle GPU might be busy."
-        except Exception as e:
-            return f"Error communicating with Kaggle: {e}"
+        return cleaned_reply
 
 
 # =====================================================================
@@ -350,7 +368,7 @@ Guidelines for responding:
 # =====================================================================
 async def speak_text(text: str):
     """Synthesizes natural spoken response and plays it on device speakers."""
-    skip_prefixes = ("Cannot connect", "Error communicating", "Kaggle Brain Server Error", "Request to Kaggle")
+    skip_prefixes = ("Cannot connect", "Error communicating", "Azure Llama API Error", "Azure Connection Error")
     if not AUDIO_ENABLED or not text or not text.strip():
         return
     if any(text.startswith(p) for p in skip_prefixes):
@@ -437,32 +455,25 @@ def get_or_trigger_ngrok_url(force_trigger: bool = False) -> str:
 # =====================================================================
 async def run_dhruv(trigger_requested: bool = False, chat_mode: bool = True):
     print("=" * 65)
-    print("⚡ DHRUV ROBOT: DUAL-PIPELINE KAGGLE-GPU ARCHITECTURE")
+    print("⚡ DHRUV ROBOT: DUAL-PIPELINE ARCHITECTURE")
     print("=" * 65)
 
     ngrok_url = get_or_trigger_ngrok_url(force_trigger=trigger_requested)
-    if not ngrok_url:
-        print("[!] FATAL: No Ngrok URL available.")
-        print("    Please run with '--trigger' or add your Kaggle Ngrok URL to .env as NGROK_BASE_URL.")
-        return
+    brain = DhruvBrainEngine(ngrok_url)
 
-    print(f"🌐 Kaggle Ollama URL : {ngrok_url}")
-    print(f"🧠 Brain Model (LLM) : {BRAIN_MODEL} (Running 100% on Kaggle GPU)")
-    print(f"👁️ Vision Model (VLM): {VISION_MODEL} (Running 100% on Kaggle GPU)")
-    print(f"💬 Interaction Mode  : {'TEXT CHAT (--chat)' if chat_mode else 'DEFAULT'}")
-    print(f"🔊 Spoken Voice      : {'ENABLED (' + TTS_VOICE + ' @ ' + TTS_SPEED + ')' if AUDIO_ENABLED else 'DISABLED'}")
+    brain_source = f"AZURE AI ({AZURE_DEPLOYMENT})" if brain.use_azure else f"KAGGLE GPU ({KAGGLE_FALLBACK_MODEL})"
+
+    print(f"🧠 Brain Engine (LLM) : {brain_source}")
+    print(f"👁️ Vision Engine (VLM): MOONDREAM on Kaggle GPU ({ngrok_url if ngrok_url else 'Not connected'})")
+    print(f"💬 Interaction Mode   : {'TEXT CHAT (--chat)' if chat_mode else 'DEFAULT'}")
+    print(f"🔊 Spoken Voice       : {'ENABLED (' + TTS_VOICE + ' @ ' + TTS_SPEED + ')' if AUDIO_ENABLED else 'DISABLED'}")
     print("─" * 65)
 
     # Initialize camera hardware
     cam = LiveCameraStream(CAMERA_INDEX).start()
     await asyncio.sleep(0.5)
 
-    brain = KaggleDhruvBrain(ngrok_url)
-
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        # Verify and ensure Kaggle has both models ready
-        await brain.ensure_models(client)
-
+    async with httpx.AsyncClient(timeout=45.0) as client:
         print("\n💬 [Dhruv Online]: Type your questions below. Dhruv will respond and speak out loud!")
         print("   (Type 'exit' or 'quit' to close)\n")
 
@@ -495,8 +506,8 @@ async def run_dhruv(trigger_requested: bool = False, chat_mode: bool = True):
                     else:
                         print("   [Camera]: Frame not available from video device.")
 
-                # 2. Query Kaggle Brain over Ngrok
-                print("🧠 Dhruv is reasoning on Kaggle GPU...")
+                # 2. Query Dhruv Brain
+                print(f"🧠 Dhruv is reasoning via {brain_source}...")
                 t0 = time.time()
                 response = await brain.query(client, frame, user_query, ocr_text)
                 dt = time.time() - t0
