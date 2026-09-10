@@ -12,7 +12,7 @@ import tempfile
 import numpy as np
 import face_recognition
 
-SERVER_URL = "http://127.0.0.1:8000/autonomous" # Change to Mac's IP (e.g. 192.168.x.x) when running on Jetson Nano
+SERVER_URL = "http://127.0.0.1:8000/autonomous" # Running onboard the Jetson Nano
 
 # Load Known Faces
 known_faces_dir = "known_faces"

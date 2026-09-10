@@ -1,0 +1,28 @@
+# Core server
+fastapi
+uvicorn[standard]
+python-multipart
+requests
+python-dotenv
+
+# LangGraph and LLM (Using standard LangChain libs)
+langchain
+langchain-community
+langchain-core
+langchain-openai
+langgraph
+pydantic
+
+# Hardware & Vision (Jetson compatible)
+bleak
+opencv-python-headless
+numpy<2.0.0
+Pillow
+
+# Facial Recognition
+face_recognition
+setuptools==69.5.1
+
+# Audio & TTS
+edge-tts
+pydub

@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  dhruv-onboard:
+    build: .
+    container_name: dhruv_onboard_brain
+    network_mode: "host" # Required to access Jetson's native Bluetooth stack
+    privileged: true # Required for full USB/Hardware access
+    devices:
+      - "/dev/video0:/dev/video0" # Camera access
+      - "/dev/snd:/dev/snd" # Audio speaker access
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    volumes:
+      - ./.env:/app/.env
+      - ./known_faces:/app/known_faces
+      - ./people_context.json:/app/people_context.json
+    restart: unless-stopped
