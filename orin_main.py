@@ -1,7 +1,7 @@
 """
-DhruvOrin - Autonomous Exploration & Voice Command Pipeline
-============================================================
-Zero Local Ollama | Zero LangGraph | Zero LangChain | 100% Native Python
+DhruvRobot - Jetson Orin Nano Native Pipeline
+=============================================
+Zero Local Ollama | Zero LangGraph | Zero LangChain | 100% Native Async Python
 
 Modes & Architecture:
   1. 🔭 CONTINUOUS EXPLORATION MODE (Default):
@@ -42,14 +42,14 @@ if hasattr(sys.stdout, "reconfigure"):
 
 BASE_DIR = Path(__file__).parent.resolve()
 load_dotenv(BASE_DIR / ".env", override=True)
-if (BASE_DIR.parent / ".env").exists():
-    load_dotenv(BASE_DIR.parent / ".env", override=False)
+if (BASE_DIR / "DhruvOrin" / ".env").exists():
+    load_dotenv(BASE_DIR / "DhruvOrin" / ".env", override=False)
 
 # Ensure Kaggle CLI discovers kaggle.json
-if (BASE_DIR / "kaggle.json").exists():
-    os.environ.setdefault("KAGGLE_CONFIG_DIR", str(BASE_DIR))
-elif (BASE_DIR.parent / "Trigger" / "kaggle.json").exists():
-    os.environ.setdefault("KAGGLE_CONFIG_DIR", str(BASE_DIR.parent / "Trigger"))
+if (BASE_DIR / "DhruvOrin" / "kaggle.json").exists():
+    os.environ.setdefault("KAGGLE_CONFIG_DIR", str(BASE_DIR / "DhruvOrin"))
+elif (BASE_DIR / "Trigger" / "kaggle.json").exists():
+    os.environ.setdefault("KAGGLE_CONFIG_DIR", str(BASE_DIR / "Trigger"))
 
 # =====================================================================
 # CONFIGURATION
@@ -298,7 +298,6 @@ class WakeWordListener:
 
                 try:
                     text = recognizer.recognize_google(audio).lower().strip()
-                    # Check for wake word matches
                     if any(t in text for t in self.WAKE_TRIGGERS):
                         print(f"\n⚡ [Wake Word Detected via Mic]: \"{text}\"")
                         self.callback()
@@ -502,7 +501,7 @@ def get_or_trigger_ngrok_url(force_trigger: bool = False) -> str:
         return active_url
 
     try:
-        from trigger import trigger_and_get_url
+        from DhruvOrin.trigger import trigger_and_get_url
         print("[*] Contacting Kaggle to obtain active Ngrok tunnel...")
         url = trigger_and_get_url(timeout_seconds=60)
         if url:
@@ -656,7 +655,7 @@ async def run_dhruv(trigger_requested: bool = False):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="DhruvOrin Autonomous Pipeline")
+    parser = argparse.ArgumentParser(description="DhruvRobot Pipeline")
     parser.add_argument("--trigger", action="store_true", help="Trigger Kaggle GPU instance and automatically obtain active Ngrok URL")
     args = parser.parse_args()
 

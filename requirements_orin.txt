@@ -1,0 +1,20 @@
+# ========================================================
+# DhruvRobot - Jetson Orin Nano Lightweight Dependencies
+# Zero LangGraph / Zero LangChain
+# ========================================================
+
+# Computer Vision & OCR
+opencv-python>=4.8.0
+pytesseract>=0.3.10
+numpy>=1.24.0
+
+# Asynchronous HTTP & Console
+httpx>=0.25.0
+aioconsole>=0.6.0
+python-dotenv>=1.0.0
+
+# Text-to-Speech (requires mpv or aplay installed on Jetson: sudo apt-get install -y mpv)
+edge-tts>=6.1.0
+
+# Optional: If you want to use local Piper TTS offline
+# piper-tts

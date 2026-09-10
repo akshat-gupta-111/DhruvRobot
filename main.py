@@ -1,70 +1,37 @@
-import asyncio
+"""
+DhruvRobot - Root Runner
+========================
+Dispatches to the lightweight Kaggle-GPU / Orin single-script pipeline.
+Zero LangGraph | Zero Local Ollama | 100% Native Python
+
+Usage:
+  python main.py --chat       # Interactive text chat (keyboard input + spoken voice output)
+  python main.py --trigger    # Auto-trigger Kaggle GPU and infer Ngrok URL
+"""
+
 import sys
-from aioconsole import ainput
-from core.graph import dhruv_brain
-from modalities.vision.scene_analyzer import capture_and_analyze
-from modalities.audio.tts import speak_text  # <-- Added TTS import
-from langchain_core.messages import HumanMessage
-from dotenv import load_dotenv
+from pathlib import Path
 
-load_dotenv()
+# Add DhruvOrin to path
+BASE_DIR = Path(__file__).parent.resolve()
+sys.path.insert(0, str(BASE_DIR / "DhruvOrin"))
 
-live_context = {"current_scene": "Initializing vision..."}
-
-async def chat_loop():
-    print("\nDhruv is waking up... (Type 'exit' to quit)\n")
-    thread_config = {"configurable": {"thread_id": "1"}} 
-    
-    while True:
-        try:
-            # ainput handles terminal input gracefully in async without blocking threads
-            user_input = await ainput("You: ")
-        except (EOFError, KeyboardInterrupt):
-            print("\nForce quit detected.")
-            break 
-
-        if not user_input.strip():
-            continue
-
-        if user_input.lower() in ['exit', 'quit']:
-            break
-            
-        state_input = {
-            "messages": [HumanMessage(content=user_input)],
-            "current_scene": live_context.get("current_scene", "No vision data")
-        }
-        
-        try:
-            for event in dhruv_brain.stream(state_input, config=thread_config):
-                for value in event.values():
-                    # Extract the response text
-                    response_text = value['messages'][-1].content
-                    print(f"Dhruv: {response_text}")
-                    
-                    # <-- Added: Trigger the audio asynchronously
-                    await speak_text(response_text)
-                    
-        except Exception as e:
-            print(f"Graph execution error: {e}")
-
-async def main():
-    stop_event = asyncio.Event()
-    vision_task = asyncio.create_task(capture_and_analyze(live_context, stop_event))
-    
-    try:
-        await chat_loop()
-    finally:
-        print("\nInitiating system shutdown... (releasing hardware)")
-        stop_event.set()
-        await asyncio.sleep(1)
-        vision_task.cancel()
-        print("Dhruv: Offline.")
+from orin_main import run_dhruv
+import asyncio
+import argparse
+import os
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="DhruvRobot Pipeline")
+    parser.add_argument("--chat", action="store_true", default=True, help="Run in text chat mode with voice output (Keyboard input + Spoken speech)")
+    parser.add_argument("--trigger", action="store_true", help="Trigger Kaggle GPU instance and automatically obtain active Ngrok URL")
+    args = parser.parse_args()
+
+    trigger_flag = args.trigger or os.getenv("AUTO_TRIGGER_KAGGLE", "false").lower() in ("true", "1", "yes")
+
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     try:
-        # aioconsole works best when setting the event loop policy on Windows/Mac
-        if sys.platform == 'win32':
-            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-        asyncio.run(main())
+        asyncio.run(run_dhruv(trigger_requested=trigger_flag, chat_mode=args.chat))
     except KeyboardInterrupt:
-        pass # Caught gracefully at the highest level
+        print("\nShutdown signal received. Exiting.")

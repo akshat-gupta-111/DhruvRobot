@@ -1,0 +1,1 @@
+print("Akshat BSDKA hai")
