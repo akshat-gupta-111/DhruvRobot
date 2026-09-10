@@ -1,8 +1,8 @@
-# Core server
 fastapi
 uvicorn[standard]
 python-multipart
 requests
+httpx
 python-dotenv
 
 # LangGraph and LLM (Using standard LangChain libs)

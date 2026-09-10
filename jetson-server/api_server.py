@@ -13,7 +13,7 @@ import time
 import random
 from enum import Enum
 from fastapi.responses import StreamingResponse, Response
-from core.graph import dhruv_brain
+
 from memory.history_buffer import VisionHistory
 from v2.autonomous_logic import evaluate_scene_agentic, RobotAction
 from tools.actuators import drive_vehicle, control_motor, emergency_stop, spin_vehicle, diagonal_movement
@@ -252,60 +252,7 @@ async def autonomous_mode(image: UploadFile = File(None), names: str = Form(None
     headers = {"X-Has-Audio": "false"}
     return Response(content="ok", status_code=200, headers=headers)
 
-@app.post("/interact")
-async def interact(query: str = Form(...), image: UploadFile = File(None)):
-    print("\n" + "─" * 55)
-    print(f"📥 Request Received | Query: \"{query}\"")
 
-    b64_payload = None
-    image_status = "No Image"
-
-    if image is not None:
-        image_bytes = await image.read()
-        if len(image_bytes) > 0:
-            b64_payload = base64.b64encode(image_bytes).decode('utf-8')
-            image_status = f"Attached ({len(image_bytes)/1024:.1f} KB)"
-            print(f"📸 Image Payload: ✅ {image_status}")
-
-    # Build input state for the agent graph
-    state_input = {
-        "messages": [HumanMessage(content=query)],
-        "raw_image_b64": b64_payload,
-        "current_scene": ""
-    }
-
-    # Execute graph asynchronously
-    response_text = ""
-    async for event in dhruv_brain.astream(state_input, config={"configurable": {"thread_id": "1"}}):
-        for node_name, value in event.items():
-            if "messages" in value and value["messages"]:
-                last_msg = value["messages"][-1]
-                # If a tool was executed, log the hardware action
-                if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
-                    for tc in last_msg.tool_calls:
-                        print(f"🔧 Tool Triggered: {tc['name']}({tc['args']})")
-                elif hasattr(last_msg, "content") and last_msg.content:
-                    response_text = last_msg.content
-
-    if not response_text:
-        response_text = "Movement command executed."
-
-    clean_text = response_text.replace("*", "").replace("#", "")
-    print(f"🗣️ Response    : {clean_text}")
-    print("─" * 55)
-
-    headers = {
-        "X-Agent-Text": urllib.parse.quote(response_text),
-        "X-Image-Status": urllib.parse.quote(image_status)
-    }
-
-    async def audio_generator():
-        communicate = edge_tts.Communicate(clean_text, VOICE, rate=SPEED_RATE)
-        async for chunk in communicate.stream():
-            if chunk["type"] == "audio":
-                yield chunk["data"]
-
-    return StreamingResponse(audio_generator(), media_type="audio/mpeg", headers=headers)
 
 
 if __name__ == "__main__":
