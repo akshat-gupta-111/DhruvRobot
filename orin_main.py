@@ -71,6 +71,7 @@ TTS_SPEED = os.getenv("TTS_SPEED", "+20%")
 # ── Known Figures & People Recognition ────────────────────────────────
 KNOWN_FACES_DIR = os.getenv("KNOWN_FACES_DIR", str(BASE_DIR / "known_faces"))
 PEOPLE_CONTEXT_PATH = os.getenv("PEOPLE_CONTEXT_PATH", str(BASE_DIR / "people_context.json"))
+FACE_RECOGNITION_TOLERANCE = float(os.getenv("FACE_RECOGNITION_TOLERANCE", "0.60"))
 
 # ── Vision Backend: Moondream on Kaggle GPU via Ngrok ────────────────
 NGROK_BASE_URL = os.getenv("NGROK_BASE_URL", "").rstrip("/")
@@ -207,10 +208,15 @@ def clean_for_speech_and_display(raw_text: str) -> str:
 
 
 # =====================================================================
-# 4. AUDIO SUBSYSTEM: JETSON-NATIVE TTS
+# =====================================================================
+# 4. AUDIO SUBSYSTEM: JETSON-NATIVE TTS WITH REAL-TIME STREAMING
 # =====================================================================
 async def speak_text(text: str):
-    """Synthesizes natural spoken response and plays it on device speakers."""
+    """
+    Synthesizes natural spoken response and streams audio directly to device speakers
+    without writing temporary audio files to disk.
+    Supports real-time stdin piping to mpv, ffplay, or mpg123.
+    """
     global is_dhruv_speaking
     skip_prefixes = ("Cannot connect", "Error communicating", "Azure API Error", "Azure Connection Error")
     if not AUDIO_ENABLED or not text or not text.strip():
@@ -222,50 +228,79 @@ async def speak_text(text: str):
     if not clean_text:
         return
 
-    temp_audio = str(BASE_DIR / f"temp_dhruv_{int(time.time() * 1000)}.mp3")
-
+    temp_audio = None
     try:
         is_dhruv_speaking = True  # Mute microphone listener during self-speech
         import edge_tts
         communicate = edge_tts.Communicate(clean_text, TTS_VOICE, rate=TTS_SPEED)
-        await communicate.save(temp_audio)
 
-        if not os.path.exists(temp_audio) or os.path.getsize(temp_audio) == 0:
-            return
-
+        # Detect streaming-capable player
         current_os = platform.system()
-        cmd = None
+        stream_cmd = None
 
         if current_os == "Linux":
             for candidate in ["mpv", "ffplay", "mpg123"]:
                 if subprocess.run(["which", candidate], capture_output=True).returncode == 0:
                     if candidate == "mpv":
-                        cmd = ["mpv", "--no-video", "--really-quiet", temp_audio]
+                        stream_cmd = ["mpv", "--no-video", "--really-quiet", "-"]
                     elif candidate == "ffplay":
-                        cmd = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", temp_audio]
+                        stream_cmd = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", "-i", "-"]
                     elif candidate == "mpg123":
-                        cmd = ["mpg123", "-q", temp_audio]
+                        stream_cmd = ["mpg123", "-q", "-"]
                     break
         elif current_os == "Darwin":
-            cmd = ["afplay", temp_audio]
+            if subprocess.run(["which", "mpv"], capture_output=True).returncode == 0:
+                stream_cmd = ["mpv", "--no-video", "--really-quiet", "-"]
+            elif subprocess.run(["which", "ffplay"], capture_output=True).returncode == 0:
+                stream_cmd = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", "-i", "-"]
         elif current_os == "Windows":
             if subprocess.run(["where", "mpv"], capture_output=True).returncode == 0:
-                cmd = ["mpv", "--no-video", "--really-quiet", temp_audio]
-            else:
-                cmd = ["powershell", "-c",
-                       f"(New-Object Media.SoundPlayer '{temp_audio}').PlaySync()"]
+                stream_cmd = ["mpv", "--no-video", "--really-quiet", "-"]
 
-        if cmd:
-            proc = await asyncio.create_subprocess_exec(*cmd)
-            await proc.wait()
+        # If streaming player is available, pipe audio chunks directly to stdin in real-time (Zero Disk I/O)
+        if stream_cmd:
+            proc = await asyncio.create_subprocess_exec(
+                *stream_cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL
+            )
+            try:
+                async for chunk in communicate.stream():
+                    if chunk["type"] == "audio" and proc.stdin:
+                        proc.stdin.write(chunk["data"])
+                        await proc.stdin.drain()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            finally:
+                if proc.stdin and not proc.stdin.is_closing():
+                    try:
+                        proc.stdin.close()
+                        await proc.stdin.wait_closed()
+                    except Exception:
+                        pass
+                await proc.wait()
         else:
-            print("[TTS Warning]: No audio player found. Install mpv, ffplay, or mpg123.")
+            # Fallback for systems without stdin streaming player (e.g. Windows SoundPlayer or afplay)
+            temp_audio = str(BASE_DIR / f"temp_dhruv_{int(time.time() * 1000)}.mp3")
+            await communicate.save(temp_audio)
+            if os.path.exists(temp_audio) and os.path.getsize(temp_audio) > 0:
+                if current_os == "Darwin":
+                    proc = await asyncio.create_subprocess_exec("afplay", temp_audio)
+                    await proc.wait()
+                elif current_os == "Windows":
+                    proc = await asyncio.create_subprocess_exec(
+                        "powershell", "-c", f"(New-Object Media.SoundPlayer '{temp_audio}').PlaySync()"
+                    )
+                    await proc.wait()
+                else:
+                    print("[TTS Warning]: No audio player found. Install mpv: sudo apt-get install -y mpv")
 
     except Exception as e:
         print(f"[TTS Warning]: {e}")
     finally:
         is_dhruv_speaking = False  # Re-enable microphone listener
-        if os.path.exists(temp_audio):
+        if temp_audio and os.path.exists(temp_audio):
             try:
                 os.remove(temp_audio)
             except OSError:
@@ -550,7 +585,8 @@ async def run_dhruv(trigger_requested: bool = False):
         try:
             vision_engine = JarvisVisionEngine(
                 known_faces_dir=KNOWN_FACES_DIR,
-                context_json_path=PEOPLE_CONTEXT_PATH
+                context_json_path=PEOPLE_CONTEXT_PATH,
+                tolerance=FACE_RECOGNITION_TOLERANCE
             )
         except Exception as e:
             print(f"[Vision Engine Notice]: Could not initialize face engine: {e}")
@@ -558,8 +594,8 @@ async def run_dhruv(trigger_requested: bool = False):
     active_profiles = len(vision_engine.known_face_names) if vision_engine else 0
     print(f"🧠 Brain Engine (LLM)   : AZURE AI ({AZURE_DEPLOYMENT})")
     print(f"👁️ Vision Engine (VLM)  : MOONDREAM on Kaggle ({ngrok_url if ngrok_url else 'Not connected'})")
-    print(f"👤 Known Figures Engine : {f'ACTIVE ({active_profiles} profiles loaded)' if active_profiles > 0 else 'Active (0 reference faces)' if vision_engine else 'DISABLED'}")
-    print(f"🔊 Spoken Voice         : {'ENABLED (' + TTS_VOICE + ' @ ' + TTS_SPEED + ')' if AUDIO_ENABLED else 'DISABLED'}")
+    print(f"👤 Known Figures Engine : {f'ACTIVE ({active_profiles} samples @ tol={vision_engine.tolerance:.2f})' if active_profiles > 0 else 'Active (0 reference faces)' if vision_engine else 'DISABLED'}")
+    print(f"🔊 Spoken Voice         : {'ENABLED (Streaming via ' + TTS_VOICE + ' @ ' + TTS_SPEED + ')' if AUDIO_ENABLED else 'DISABLED'}")
     print("─" * 68)
     print("Mode 1: 🔭 CONTINUOUS EXPLORATION (Observing & speaking scene details)")
     print("Mode 2: ⚡ COMMAND ACCEPTING (Say 'Listen Dhruv !' to interrupt)")
