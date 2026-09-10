@@ -135,6 +135,20 @@ class KaggleMoondreamBrain:
         self.ngrok_url = new_url.rstrip("/")
         self.endpoint = f"{self.ngrok_url}/api/generate"
 
+    @staticmethod
+    def _looks_like_garbage(text: str) -> bool:
+        """Detect raw tensor/weight output instead of natural language."""
+        if not text or len(text.strip()) < 2:
+            return True
+        # Raw weights look like lists of floats: [0.0, 0.12, 0.38, ...]
+        import re
+        if re.search(r'\[\s*-?\d+\.\d+\s*,', text):
+            return True
+        # Pure punctuation / tokens like !!!
+        if re.fullmatch(r'[!?.\-_\s]+', text.strip()):
+            return True
+        return False
+
     async def query(self, client: httpx.AsyncClient, frame, user_query: str, ocr_text: str) -> str:
         b64_img = None
         if frame is not None:
@@ -142,21 +156,29 @@ class KaggleMoondreamBrain:
             if success:
                 b64_img = base64.b64encode(buffer).decode("utf-8")
 
-        prompt_parts = [
-            "You are Dhruv, an intelligent living robotic companion.",
-        ]
-        if ocr_text:
-            prompt_parts.append(f"Visual Text Detected: '{ocr_text}'.")
-        
-        prompt_parts.append(f"User Query: {user_query}")
-        prompt_parts.append("Answer directly and conversationally in 1-3 sentences. Do not use markdown emojis.")
-        full_prompt = "\n".join(prompt_parts)
+        # Build a clear, concise prompt Moondream can follow
+        if b64_img:
+            # Vision query — keep it short and direct for Moondream
+            full_prompt = (
+                f"You are Dhruv, a helpful robot. "
+                f"{('Text visible in scene: ' + ocr_text + '. ') if ocr_text else ''}"
+                f"User asked: {user_query}\n"
+                f"Describe what you see and answer in 1-3 clear sentences."
+            )
+        else:
+            # Text-only chat — conversational assistant
+            full_prompt = (
+                f"You are Dhruv, a friendly and intelligent robotic companion. "
+                f"Answer the following in 1-3 natural spoken sentences without markdown or bullet points.\n"
+                f"User: {user_query}\nDhruv:"
+            )
 
+        # Use stream=True so we can read NDJSON line-by-line (more reliable with Ollama)
         payload = {
             "model": MOONDREAM_MODEL,
             "prompt": full_prompt,
-            "stream": False,
-            "options": {"temperature": 0.2}
+            "stream": True,
+            "options": {"temperature": 0.7, "num_predict": 200}
         }
         if b64_img:
             payload["images"] = [b64_img]
@@ -164,14 +186,35 @@ class KaggleMoondreamBrain:
             payload["context"] = self.context
 
         try:
-            res = await client.post(self.endpoint, json=payload, timeout=35.0)
-            if res.status_code == 200:
-                data = res.json()
-                self.context = data.get("context", self.context)
-                reply = data.get("response", "").strip()
-                return reply.strip('"').strip("'").strip()
-            else:
-                return f"Kaggle Moondream Server Error: HTTP {res.status_code} - {res.text}"
+            import json as _json
+            full_response = ""
+            async with client.stream("POST", self.endpoint, json=payload, timeout=45.0) as res:
+                if res.status_code != 200:
+                    body = await res.aread()
+                    return f"Kaggle Moondream Server Error: HTTP {res.status_code} - {body.decode(errors='replace')}"
+                async for raw_line in res.aiter_lines():
+                    raw_line = raw_line.strip()
+                    if not raw_line:
+                        continue
+                    try:
+                        chunk = _json.loads(raw_line)
+                        token = chunk.get("response", "")
+                        full_response += token
+                        if chunk.get("done", False):
+                            ctx = chunk.get("context")
+                            if ctx:
+                                self.context = ctx
+                            break
+                    except _json.JSONDecodeError:
+                        continue
+
+            reply = full_response.strip().strip('"').strip("'")
+
+            if self._looks_like_garbage(reply):
+                return "I received an unclear signal from the AI. Please try asking again."
+
+            return reply
+
         except httpx.ConnectError:
             return f"Cannot connect to Kaggle Ngrok tunnel at {self.endpoint}. Is the Kaggle instance running?"
         except httpx.TimeoutException:
@@ -185,10 +228,18 @@ class KaggleMoondreamBrain:
 # =====================================================================
 async def speak_text(text: str):
     """Synthesizes voice response and plays it on device speakers."""
-    if not AUDIO_ENABLED or not text.strip() or text.startswith("Cannot connect") or text.startswith("Error communicating"):
+    skip_prefixes = ("Cannot connect", "Error communicating", "Kaggle Moondream Server Error", "Request to Kaggle")
+    if not AUDIO_ENABLED or not text or not text.strip():
+        return
+    if any(text.startswith(p) for p in skip_prefixes):
         return
 
-    clean_text = text.replace("*", "").replace("#", "").strip()
+    # Strip markdown artifacts
+    import re
+    clean_text = re.sub(r'[*#`_~]', '', text).strip()
+    if not clean_text:
+        return
+
     temp_audio = str(BASE_DIR / "temp_dhruv_speech.mp3")
 
     try:
@@ -196,31 +247,40 @@ async def speak_text(text: str):
         communicate = edge_tts.Communicate(clean_text, TTS_VOICE)
         await communicate.save(temp_audio)
 
+        if not os.path.exists(temp_audio) or os.path.getsize(temp_audio) == 0:
+            print("[TTS Warning]: Audio file was empty — check that the text is valid.")
+            return
+
         current_os = platform.system()
-        player = None
+        cmd = None
 
         if current_os == "Linux":
-            for candidate in ["mpv", "ffplay", "aplay"]:
+            # Priority: mpv > ffplay > mpg123 (mpg123 natively decodes mp3, aplay cannot)
+            for candidate in ["mpv", "ffplay", "mpg123"]:
                 if subprocess.run(["which", candidate], capture_output=True).returncode == 0:
-                    player = candidate
+                    if candidate == "mpv":
+                        cmd = ["mpv", "--no-video", "--really-quiet", temp_audio]
+                    elif candidate == "ffplay":
+                        cmd = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", temp_audio]
+                    elif candidate == "mpg123":
+                        cmd = ["mpg123", "-q", temp_audio]
                     break
         elif current_os == "Darwin":
-            player = "afplay"
-        elif current_os == "Windows":
-            player = "mpv"
-
-        if player == "mpv":
-            cmd = ["mpv", "--no-video", "--really-quiet", temp_audio]
-        elif player == "afplay":
             cmd = ["afplay", temp_audio]
-        elif player == "ffplay":
-            cmd = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", temp_audio]
-        else:
-            cmd = None
+        elif current_os == "Windows":
+            # Use powershell media player as fallback if mpv not installed
+            if subprocess.run(["where", "mpv"], capture_output=True).returncode == 0:
+                cmd = ["mpv", "--no-video", "--really-quiet", temp_audio]
+            else:
+                cmd = ["powershell", "-c",
+                       f"(New-Object Media.SoundPlayer '{temp_audio}').PlaySync()"]
 
         if cmd:
             proc = await asyncio.create_subprocess_exec(*cmd)
             await proc.wait()
+        else:
+            print("[TTS Warning]: No audio player found. Install mpv, ffplay, or mpg123.")
+
     except Exception as e:
         print(f"[TTS Warning]: {e}")
     finally:
