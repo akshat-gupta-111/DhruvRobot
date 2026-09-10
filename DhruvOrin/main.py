@@ -4,9 +4,11 @@ DhruvOrin - Pure Cloud-GPU / Edge-Capture Pipeline
 Zero Local Ollama | Zero LangGraph | Zero LangChain | 100% Native Python
 
 Architecture:
-  - Local Hardware: USB/CSI Camera + Local CPU OCR + Audio Speaker
-  - Remote Cloud: Ollama + Moondream running 100% on Kaggle GPU via Ngrok tunnel
-  - Communication: Direct HTTP POST to Kaggle Ngrok endpoint (/api/generate)
+  - Local Edge (Jetson Orin Nano): USB/CSI Camera + CPU OCR + Audio Speaker
+  - Remote Cloud (Kaggle GPU via Ngrok):
+      * Vision Engine: Moondream (Scene understanding & visual captioning)
+      * Brain Engine : Llama-3.2 3B (Reasoning, general knowledge, LangGraph persona)
+  - Communication: Direct async HTTP to Kaggle Ngrok tunnel (/api/generate & /api/chat)
   - Modes:
       --chat   : Interactive terminal text chat (Keyboard Input -> Kaggle GPU -> Spoken Voice Output)
       --trigger: Auto-triggers Kaggle GPU instance and captures Ngrok URL
@@ -17,6 +19,7 @@ import sys
 import re
 import cv2
 import time
+import json
 import base64
 import asyncio
 import platform
@@ -24,7 +27,7 @@ import argparse
 import subprocess
 import threading
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 
 import httpx
 from dotenv import load_dotenv
@@ -54,9 +57,10 @@ AUDIO_ENABLED = os.getenv("AUDIO_ENABLED", "true").lower() in ("true", "1", "yes
 TTS_VOICE = os.getenv("TTS_VOICE", "en-IN-NeerjaNeural")
 TTS_SPEED = os.getenv("TTS_SPEED", "+20%")
 
-# Kaggle Ollama Moondream Settings (NO LOCAL OLLAMA)
+# Kaggle Cloud Models (Running 100% on Kaggle GPU)
 NGROK_BASE_URL = os.getenv("NGROK_BASE_URL", "").rstrip("/")
-MOONDREAM_MODEL = "moondream"
+BRAIN_MODEL = os.getenv("BRAIN_MODEL", "llama3.2:3b")
+VISION_MODEL = os.getenv("VISION_MODEL", "moondream")
 
 
 # =====================================================================
@@ -71,13 +75,25 @@ class LiveCameraStream:
         self.stream = cv2.VideoCapture(src)
         self.lock = threading.Lock()
         self.stopped = False
+        self.grabbed = False
+        self.frame = None
 
         if not self.stream.isOpened():
-            print(f"[Camera] Notice: Camera index {src} not detected. Text chat will run without camera.")
-            self.grabbed = False
-            self.frame = None
+            # Try alternate indices
+            for alt_idx in [1, 2]:
+                alt_stream = cv2.VideoCapture(alt_idx)
+                if alt_stream.isOpened():
+                    self.stream = alt_stream
+                    src = alt_idx
+                    break
+
+        if not self.stream.isOpened():
+            print(f"[Camera] Notice: Camera index {src} not detected. Running without camera.")
         else:
             self.grabbed, self.frame = self.stream.read()
+            if self.grabbed:
+                h, w = self.frame.shape[:2]
+                print(f"[Camera] Initialized successfully on index {src} ({w}x{h} px).")
 
     def start(self):
         if self.stream.isOpened():
@@ -92,7 +108,7 @@ class LiveCameraStream:
                 self.frame = frame
             time.sleep(0.01)
 
-    def read(self):
+    def read(self) -> Tuple[bool, Optional[object]]:
         with self.lock:
             if self.frame is not None:
                 return self.grabbed, self.frame.copy()
@@ -102,13 +118,6 @@ class LiveCameraStream:
         self.stopped = True
         if self.stream.isOpened():
             self.stream.release()
-
-
-def get_fresh_frame(cam: LiveCameraStream) -> Tuple[bool, Optional[object]]:
-    """Flush stale buffer frames and return the true current live frame."""
-    for _ in range(5):
-        cam.read()
-    return cam.read()
 
 
 # =====================================================================
@@ -128,7 +137,7 @@ _VISION_PATTERNS = [
 ]
 
 def is_vision_query(query: str) -> bool:
-    """Returns True ONLY when user explicitly asks about their surroundings / vision."""
+    """Returns True ONLY when user asks about visual surroundings / reading."""
     q = query.lower().strip()
     return any(re.search(pat, q) for pat in _VISION_PATTERNS)
 
@@ -165,9 +174,7 @@ def clean_for_speech_and_display(raw_text: str) -> str:
     text = re.sub(r'^(?:Dhruv|AI|Assistant|Bot|Answer|Response)\s*:\s*', '', text, flags=re.IGNORECASE).strip()
 
     # 2. Fix numbered list artifacts (e.g., "1. Hi", "1.Hello", "1) ...")
-    # Strip leading numbers like "1. ", "1.Hi", "1) "
     text = re.sub(r'^\d+[\.\)]\s*', '', text)
-    # Convert middle list numbers into smooth sentence transitions
     text = re.sub(r'[\r\n]+\s*\d+[\.\)]\s*', '. ', text)
     text = re.sub(r'\.\s*\d+[\.\)]\s*', '. ', text)
 
@@ -193,179 +200,147 @@ def clean_for_speech_and_display(raw_text: str) -> str:
 
 
 # =====================================================================
-# ORIGINAL DHRUV PERSONA & PROMPT (From core/graph.py & api_server.py)
+# 4. KAGGLE DUAL-ENGINE: MOONDREAM (VISION) + LLAMA (BRAIN)
 # =====================================================================
-ORIGINAL_SYSTEM_PROMPT_TEMPLATE = """You are Dhruv, an intelligent, living entity. 
-You can 'see' your environment through a dual-pipeline vision system that provides both a scene description and raw OCR text.
-
-CURRENT VISUAL CONTEXT:
-{visual_context}
-
-Guidelines for responding:
-1. If the user asks what you see, synthesize the SCENE DESCRIPTION and VISIBLE TEXT DETECTED naturally.
-2. The VISIBLE TEXT DETECTED might contain typos or fragmented words (it is raw OCR data). Use your intelligence to infer what the text actually says based on the scene context.
-3. If the user asks you to read something, quote the text from the VISIBLE TEXT section.
-4. Dont use emojis.
-"""
-
-ORIGINAL_MOONDREAM_SCENE_PROMPT = "Describe the current scene, objects, and people. Do not attempt to read text."
-
-
-# =====================================================================
-# 4. KAGGLE MOONDREAM REASONING ENGINE (RUNS 100% ON KAGGLE GPU)
-# =====================================================================
-class KaggleMoondreamBrain:
+class KaggleDhruvBrain:
     """
-    Directly queries the remote Moondream instance running inside Ollama
-    on Kaggle GPU via the Ngrok tunnel.
-    Preserves dialogue memory and scene context using the exact original
-    Dhruv LangGraph architecture and persona.
+    Directly mirrors the original LangGraph dual-pipeline architecture:
+      - Vision: Moondream Cloud GPU generates scene descriptions from live camera
+      - OCR: Local CPU Tesseract extracts visible text
+      - Brain: Llama-3.2 / Qwen running on Kaggle GPU synthesizes knowledge,
+               persona, conversation, and visual context via /api/chat.
     """
     def __init__(self, ngrok_url: str):
         self.ngrok_url = ngrok_url.rstrip("/")
-        self.endpoint = f"{self.ngrok_url}/api/generate"
-        self.history: List[Tuple[str, str]] = []  # List of (user_query, dhruv_reply)
+        self.chat_endpoint = f"{self.ngrok_url}/api/chat"
+        self.generate_endpoint = f"{self.ngrok_url}/api/generate"
+        self.history: List[Dict[str, str]] = []  # List of {"role": "...", "content": "..."}
         self.last_visual_context: str = "No visual data available."
 
     def update_url(self, new_url: str):
         self.ngrok_url = new_url.rstrip("/")
-        self.endpoint = f"{self.ngrok_url}/api/generate"
+        self.chat_endpoint = f"{self.ngrok_url}/api/chat"
+        self.generate_endpoint = f"{self.ngrok_url}/api/generate"
 
-    @staticmethod
-    def _looks_like_garbage(text: str) -> bool:
-        """Detect raw tensor/weight output or internal model tokens."""
-        if not text or len(text.strip()) < 2:
-            return True
-        if re.search(r'\[\s*-?\d+\.\d+\s*,', text):
-            return True
-        if re.fullmatch(r'[!?.\-_\s]+', text.strip()):
-            return True
-        return False
+    async def ensure_models(self, client: httpx.AsyncClient):
+        """Verifies required models exist on Kaggle Ollama, pulling if needed."""
+        try:
+            r = await client.get(f"{self.ngrok_url}/api/tags", timeout=10.0)
+            if r.status_code == 200:
+                installed = [m.get("name", "") for m in r.json().get("models", [])]
+                
+                # Check Brain Model
+                if not any(BRAIN_MODEL in m for m in installed):
+                    print(f"[*] Brain model '{BRAIN_MODEL}' not found on Kaggle GPU. Pulling now (~20s)...")
+                    await client.post(f"{self.ngrok_url}/api/pull", json={"model": BRAIN_MODEL, "stream": False}, timeout=180.0)
+                    print(f"[+] Brain model '{BRAIN_MODEL}' ready on Kaggle.")
+                
+                # Check Vision Model
+                if not any(VISION_MODEL in m for m in installed):
+                    print(f"[*] Vision model '{VISION_MODEL}' not found on Kaggle GPU. Pulling now...")
+                    await client.post(f"{self.ngrok_url}/api/pull", json={"model": VISION_MODEL, "stream": False}, timeout=180.0)
+                    print(f"[+] Vision model '{VISION_MODEL}' ready on Kaggle.")
+        except Exception as e:
+            print(f"[Model Check Note]: {e}")
 
-    async def _query_ollama(self, client: httpx.AsyncClient, prompt: str, b64_img: Optional[str] = None, options: Optional[dict] = None) -> str:
-        """Helper to stream response from Kaggle Ollama."""
+    async def update_scene_from_frame(self, client: httpx.AsyncClient, frame, ocr_text: str) -> str:
+        """Sends frame to Moondream on Kaggle GPU to produce scene description."""
+        success, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        if not success:
+            return ""
+
+        b64_img = base64.b64encode(buffer).decode("utf-8")
         payload = {
-            "model": MOONDREAM_MODEL,
-            "prompt": prompt,
-            "stream": True,
-            "options": options or {"temperature": 0.5, "num_predict": 150}
+            "model": VISION_MODEL,
+            "prompt": "Describe the current scene, objects, and people. Do not attempt to read text.",
+            "stream": False,
+            "images": [b64_img]
         }
-        if b64_img:
-            payload["images"] = [b64_img]
-
-        full_response = ""
-        import json as _json
-        async with client.stream("POST", self.endpoint, json=payload, timeout=45.0) as res:
-            if res.status_code != 200:
-                body = await res.aread()
-                return f"Kaggle Server Error: HTTP {res.status_code} - {body.decode(errors='replace')}"
-
-            async for raw_line in res.aiter_lines():
-                raw_line = raw_line.strip()
-                if not raw_line:
-                    continue
-                try:
-                    chunk = _json.loads(raw_line)
-                    token = chunk.get("response", "")
-                    full_response += token
-                    if chunk.get("done", False):
-                        break
-                except _json.JSONDecodeError:
-                    continue
-
-        return full_response.strip().strip('"').strip("'")
-
-    async def query(self, client: httpx.AsyncClient, frame, user_query: str, ocr_text: str) -> str:
-        b64_img = None
-        if frame is not None:
-            success, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-            if success:
-                b64_img = base64.b64encode(buffer).decode("utf-8")
 
         try:
-            # ── Mode A: Visual Query (Camera frame captured) ──────────────
-            if b64_img:
-                # Use original api_server.py Moondream prompt for scene description
-                is_general_scene = any(kw in user_query.lower() for kw in ["see", "scene", "look", "around", "view", "describe"])
-
-                if is_general_scene:
-                    scene_prompt = ORIGINAL_MOONDREAM_SCENE_PROMPT
-                else:
-                    scene_prompt = user_query
-
-                scene_raw = await self._query_ollama(
-                    client,
-                    prompt=scene_prompt,
-                    b64_img=b64_img,
-                    options={"temperature": 0.2, "num_predict": 120}
+            res = await client.post(self.generate_endpoint, json=payload, timeout=35.0)
+            if res.status_code == 200:
+                scene_desc = res.json().get("response", "").strip()
+                self.last_visual_context = (
+                    f"SCENE DESCRIPTION: {scene_desc}\n"
+                    f"VISIBLE TEXT DETECTED: {ocr_text if ocr_text else 'No legible text found.'}"
                 )
+                return scene_desc
+        except Exception as e:
+            print(f"[Vision Engine Warning]: {e}")
+        return ""
 
-                if self._looks_like_garbage(scene_raw):
-                    return "I had trouble recognizing the visual scene. Please try asking again."
+    async def query(self, client: httpx.AsyncClient, frame, user_query: str, ocr_text: str) -> str:
+        # ── Step 1: Dual-Pipeline Vision (if camera frame captured) ────
+        if frame is not None:
+            scene_desc = await self.update_scene_from_frame(client, frame, ocr_text)
+            if scene_desc:
+                print("   [👁️ Scene Analyzed by Moondream]")
 
-                scene_description = clean_for_speech_and_display(scene_raw)
+        # ── Step 2: Reasoning Brain (Original LangGraph System Prompt) ──
+        system_prompt = f"""You are Dhruv, an intelligent, living robotic companion with broad knowledge and vision.
+You can 'see' your environment through a dual-pipeline vision system that provides both a scene description and raw OCR text.
 
-                # Combine context exactly like original api_server.py line 94
-                combined_context = (
-                    f"SCENE DESCRIPTION: {scene_description}\n"
-                    f"VISIBLE TEXT: {ocr_text if ocr_text else 'No legible text found.'}"
-                )
-                self.last_visual_context = combined_context
+CURRENT VISUAL CONTEXT:
+{self.last_visual_context}
 
-                # Synthesize response
-                if is_general_scene:
-                    if ocr_text and ocr_text.lower() != "no legible text found.":
-                        reply = f"I see {scene_description}. Visible text detected is {ocr_text}."
-                    else:
-                        reply = f"I see {scene_description}."
-                else:
-                    reply = scene_description
+Guidelines for responding:
+1. For general knowledge, science, people, history, and conversation, answer directly and intelligently.
+2. If the user asks what you see or about your environment, synthesize the SCENE DESCRIPTION and VISIBLE TEXT DETECTED naturally.
+3. If the user asks you to read something, quote the text from the VISIBLE TEXT section.
+4. Keep answers conversational, natural, and concise (1-3 sentences).
+5. Do not use emojis."""
 
-                cleaned_reply = clean_for_speech_and_display(reply)
-                self.history.append((user_query, cleaned_reply))
-                if len(self.history) > 6:
-                    self.history.pop(0)
-                return cleaned_reply
+        # Build ChatML message list (exact LangGraph state machine structure)
+        messages = [{"role": "system", "content": system_prompt}]
+        messages.extend(self.history[-6:])  # Include last 3 conversation turns for memory
+        messages.append({"role": "user", "content": user_query})
 
-            # ── Mode B: Conversational Reasoning (Original core/graph.py) ─
-            else:
-                system_prompt = ORIGINAL_SYSTEM_PROMPT_TEMPLATE.format(
-                    visual_context=self.last_visual_context
-                )
+        payload = {
+            "model": BRAIN_MODEL,
+            "messages": messages,
+            "stream": True,
+            "options": {
+                "temperature": 0.7,
+                "top_p": 0.9,
+            }
+        }
 
-                dialogue = [system_prompt, ""]
-                for past_q, past_a in self.history[-2:]:
-                    dialogue.append(f"User: {past_q}")
-                    dialogue.append(f"Dhruv: {past_a}")
+        try:
+            full_response = ""
+            async with client.stream("POST", self.chat_endpoint, json=payload, timeout=45.0) as res:
+                if res.status_code != 200:
+                    body = await res.aread()
+                    return f"Kaggle Brain Server Error: HTTP {res.status_code} - {body.decode(errors='replace')}"
 
-                dialogue.append(f"User: {user_query}")
-                dialogue.append("Dhruv:")
-                full_prompt = "\n".join(dialogue)
+                async for raw_line in res.aiter_lines():
+                    raw_line = raw_line.strip()
+                    if not raw_line:
+                        continue
+                    try:
+                        chunk = json.loads(raw_line)
+                        token = chunk.get("message", {}).get("content", "")
+                        full_response += token
+                        if chunk.get("done", False):
+                            break
+                    except json.JSONDecodeError:
+                        continue
 
-                raw_reply = await self._query_ollama(
-                    client,
-                    prompt=full_prompt,
-                    options={
-                        "temperature": 0.6,
-                        "top_p": 0.9,
-                        "num_predict": 120,
-                        "stop": ["User:", "\nUser", "Human:", "\n\nUser"]
-                    }
-                )
+            reply = full_response.strip().strip('"').strip("'")
+            cleaned_reply = clean_for_speech_and_display(reply)
 
-                if self._looks_like_garbage(raw_reply):
-                    return "I received an unclear signal. Please ask again."
+            # Record history for multi-turn dialogue memory
+            self.history.append({"role": "user", "content": user_query})
+            self.history.append({"role": "assistant", "content": cleaned_reply})
+            if len(self.history) > 12:
+                self.history = self.history[-12:]
 
-                cleaned_reply = clean_for_speech_and_display(raw_reply)
-                self.history.append((user_query, cleaned_reply))
-                if len(self.history) > 6:
-                    self.history.pop(0)
-                return cleaned_reply
+            return cleaned_reply
 
         except httpx.ConnectError:
-            return f"Cannot connect to Kaggle Ngrok tunnel at {self.endpoint}. Is the Kaggle instance running?"
+            return f"Cannot connect to Kaggle Ngrok tunnel at {self.chat_endpoint}. Is Kaggle running?"
         except httpx.TimeoutException:
-            return "Request to Kaggle Moondream timed out. Kaggle GPU might be busy."
+            return "Request to Kaggle GPU timed out. Kaggle GPU might be busy."
         except Exception as e:
             return f"Error communicating with Kaggle: {e}"
 
@@ -375,7 +350,7 @@ class KaggleMoondreamBrain:
 # =====================================================================
 async def speak_text(text: str):
     """Synthesizes natural spoken response and plays it on device speakers."""
-    skip_prefixes = ("Cannot connect", "Error communicating", "Kaggle Moondream Server Error", "Request to Kaggle")
+    skip_prefixes = ("Cannot connect", "Error communicating", "Kaggle Brain Server Error", "Request to Kaggle")
     if not AUDIO_ENABLED or not text or not text.strip():
         return
     if any(text.startswith(p) for p in skip_prefixes):
@@ -399,7 +374,6 @@ async def speak_text(text: str):
         cmd = None
 
         if current_os == "Linux":
-            # Priority: mpv > ffplay > mpg123
             for candidate in ["mpv", "ffplay", "mpg123"]:
                 if subprocess.run(["which", candidate], capture_output=True).returncode == 0:
                     if candidate == "mpv":
@@ -463,7 +437,7 @@ def get_or_trigger_ngrok_url(force_trigger: bool = False) -> str:
 # =====================================================================
 async def run_dhruv(trigger_requested: bool = False, chat_mode: bool = True):
     print("=" * 65)
-    print("⚡ DHRUV ROBOT: KAGGLE-GPU CLOUD ARCHITECTURE")
+    print("⚡ DHRUV ROBOT: DUAL-PIPELINE KAGGLE-GPU ARCHITECTURE")
     print("=" * 65)
 
     ngrok_url = get_or_trigger_ngrok_url(force_trigger=trigger_requested)
@@ -473,26 +447,23 @@ async def run_dhruv(trigger_requested: bool = False, chat_mode: bool = True):
         return
 
     print(f"🌐 Kaggle Ollama URL : {ngrok_url}")
-    print(f"🧠 Remote VLM Model  : {MOONDREAM_MODEL} (Running 100% on Kaggle GPU)")
+    print(f"🧠 Brain Model (LLM) : {BRAIN_MODEL} (Running 100% on Kaggle GPU)")
+    print(f"👁️ Vision Model (VLM): {VISION_MODEL} (Running 100% on Kaggle GPU)")
     print(f"💬 Interaction Mode  : {'TEXT CHAT (--chat)' if chat_mode else 'DEFAULT'}")
     print(f"🔊 Spoken Voice      : {'ENABLED (' + TTS_VOICE + ' @ ' + TTS_SPEED + ')' if AUDIO_ENABLED else 'DISABLED'}")
     print("─" * 65)
 
-    # Initialize camera
+    # Initialize camera hardware
     cam = LiveCameraStream(CAMERA_INDEX).start()
     await asyncio.sleep(0.5)
 
-    brain = KaggleMoondreamBrain(ngrok_url)
+    brain = KaggleDhruvBrain(ngrok_url)
 
-    async with httpx.AsyncClient(timeout=45.0) as client:
-        try:
-            ping = await client.get(f"{ngrok_url}/api/tags", timeout=6.0)
-            if ping.status_code == 200:
-                print("[+] Verified connection to Kaggle Ollama server.")
-        except Exception:
-            pass
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        # Verify and ensure Kaggle has both models ready
+        await brain.ensure_models(client)
 
-        print("\n💬 [Chat Mode Active]: Type your questions below. Dhruv will respond and speak out loud!")
+        print("\n💬 [Dhruv Online]: Type your questions below. Dhruv will respond and speak out loud!")
         print("   (Type 'exit' or 'quit' to close)\n")
 
         try:
@@ -509,11 +480,12 @@ async def run_dhruv(trigger_requested: bool = False, chat_mode: bool = True):
                 if user_query.lower() in ("exit", "quit", "q"):
                     break
 
-                # 1. Inspect user intent: Only capture camera frame when visual context is requested
+                # 1. Dual-Pipeline Vision Check:
+                # Capture camera frame when the user asks about their environment/surroundings
                 frame = None
                 ocr_text = ""
                 if is_vision_query(user_query):
-                    grabbed, raw_frame = get_fresh_frame(cam)
+                    grabbed, raw_frame = cam.read()
                     if grabbed and raw_frame is not None:
                         frame = raw_frame
                         ocr_text = extract_text_locally(frame)
@@ -521,10 +493,10 @@ async def run_dhruv(trigger_requested: bool = False, chat_mode: bool = True):
                             print(f"   [Visible Text]: {ocr_text[:60]}{'...' if len(ocr_text) > 60 else ''}")
                         print("   [📷 Fresh camera frame captured]")
                     else:
-                        print("   [Camera]: No frame available.")
+                        print("   [Camera]: Frame not available from video device.")
 
-                # 2. Query Kaggle Moondream over Ngrok
-                print("🧠 Dhruv is thinking on Kaggle GPU...")
+                # 2. Query Kaggle Brain over Ngrok
+                print("🧠 Dhruv is reasoning on Kaggle GPU...")
                 t0 = time.time()
                 response = await brain.query(client, frame, user_query, ocr_text)
                 dt = time.time() - t0
