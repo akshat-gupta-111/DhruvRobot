@@ -7,6 +7,9 @@ Architecture:
   - Local Hardware: USB/CSI Camera + Local CPU OCR + Audio Speaker
   - Remote Cloud: Ollama + Moondream running 100% on Kaggle GPU via Ngrok tunnel
   - Communication: Direct HTTP POST to Kaggle Ngrok endpoint (/api/generate)
+  - Modes:
+      --chat   : Interactive terminal text chat (Keyboard Input -> Kaggle GPU -> Spoken Voice Output)
+      --trigger: Auto-triggers Kaggle GPU instance and captures Ngrok URL
 """
 
 import os
@@ -66,7 +69,7 @@ class LiveCameraStream:
         self.stopped = False
 
         if not self.stream.isOpened():
-            print(f"[Camera] Warning: Could not open camera device index {src}.")
+            print(f"[Camera] Notice: Camera index {src} not detected. Text chat will run without camera.")
             self.grabbed = False
             self.frame = None
         else:
@@ -126,21 +129,19 @@ class KaggleMoondreamBrain:
     def __init__(self, ngrok_url: str):
         self.ngrok_url = ngrok_url.rstrip("/")
         self.endpoint = f"{self.ngrok_url}/api/generate"
-        self.context: Optional[List[int]] = None  # Multi-turn Ollama context tokens
+        self.context: Optional[List[int]] = None
 
     def update_url(self, new_url: str):
         self.ngrok_url = new_url.rstrip("/")
         self.endpoint = f"{self.ngrok_url}/api/generate"
 
     async def query(self, client: httpx.AsyncClient, frame, user_query: str, ocr_text: str) -> str:
-        # 1. Compress image to base64
         b64_img = None
         if frame is not None:
             success, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
             if success:
                 b64_img = base64.b64encode(buffer).decode("utf-8")
 
-        # 2. Structure prompt combining user query + local OCR context
         prompt_parts = [
             "You are Dhruv, an intelligent living robotic companion.",
         ]
@@ -168,7 +169,6 @@ class KaggleMoondreamBrain:
                 data = res.json()
                 self.context = data.get("context", self.context)
                 reply = data.get("response", "").strip()
-                # Clean up any residual quotes or raw markers
                 return reply.strip('"').strip("'").strip()
             else:
                 return f"Kaggle Moondream Server Error: HTTP {res.status_code} - {res.text}"
@@ -256,11 +256,11 @@ def get_or_trigger_ngrok_url(force_trigger: bool = False) -> str:
 
 
 # =====================================================================
-# 6. MAIN EXECUTION LOOP
+# 6. MAIN INTERACTIVE EXECUTION LOOP
 # =====================================================================
-async def run_dhruv(trigger_requested: bool = False):
+async def run_dhruv(trigger_requested: bool = False, chat_mode: bool = True):
     print("=" * 65)
-    print("⚡ DHRUV ROBOT: KAGGLE-GPU CLOUD ARCHITECTURE (NO LOCAL OLLAMA)")
+    print("⚡ DHRUV ROBOT: KAGGLE-GPU CLOUD ARCHITECTURE")
     print("=" * 65)
 
     ngrok_url = get_or_trigger_ngrok_url(force_trigger=trigger_requested)
@@ -271,33 +271,34 @@ async def run_dhruv(trigger_requested: bool = False):
 
     print(f"🌐 Kaggle Ollama URL : {ngrok_url}")
     print(f"🧠 Remote VLM Model  : {MOONDREAM_MODEL} (Running 100% on Kaggle GPU)")
-    print(f"🔊 Audio Synthesizer : {'ENABLED (' + TTS_VOICE + ')' if AUDIO_ENABLED else 'DISABLED'}")
+    print(f"💬 Interaction Mode  : {'TEXT CHAT (--chat)' if chat_mode else 'DEFAULT'}")
+    print(f"🔊 Spoken Voice      : {'ENABLED (' + TTS_VOICE + ')' if AUDIO_ENABLED else 'DISABLED'}")
     print("─" * 65)
 
-    print(f"[Camera] Initializing local camera index {CAMERA_INDEX}...")
+    # Initialize camera
     cam = LiveCameraStream(CAMERA_INDEX).start()
-    await asyncio.sleep(1.0)
+    await asyncio.sleep(0.5)
 
     brain = KaggleMoondreamBrain(ngrok_url)
 
     async with httpx.AsyncClient(timeout=45.0) as client:
-        # Pre-flight ping to Kaggle
         try:
             ping = await client.get(f"{ngrok_url}/api/tags", timeout=6.0)
             if ping.status_code == 200:
                 print("[+] Verified connection to Kaggle Ollama server.")
         except Exception:
-            print("[!] Note: Could not verify /api/tags, proceeding with interaction loop...")
+            pass
 
-        print("\n[+] Dhruv is online! Type your query below, or 'exit' to quit.\n")
+        print("\n💬 [Chat Mode Active]: Type your questions below. Dhruv will respond and speak out loud!")
+        print("   (Type 'exit' or 'quit' to close)\n")
 
         try:
             while True:
                 try:
                     import aioconsole
-                    user_query = await aioconsole.ainput("\nYou: ")
+                    user_query = await aioconsole.ainput("You: ")
                 except ImportError:
-                    user_query = await asyncio.to_thread(input, "\nYou: ")
+                    user_query = await asyncio.to_thread(input, "You: ")
 
                 user_query = user_query.strip()
                 if not user_query:
@@ -305,26 +306,26 @@ async def run_dhruv(trigger_requested: bool = False):
                 if user_query.lower() in ("exit", "quit", "q"):
                     break
 
-                # 1. Grab fresh camera frame
-                grabbed, frame = cam.read()
-                if not grabbed or frame is None:
-                    print("[Camera]: Frame grab failed, querying text only.")
-                    ocr_text = ""
-                else:
+                # 1. Capture camera frame (if camera is active)
+                frame = None
+                ocr_text = ""
+                grabbed, raw_frame = cam.read()
+                if grabbed and raw_frame is not None:
+                    frame = raw_frame
                     ocr_text = extract_text_locally(frame)
                     if ocr_text:
-                        print(f"   [OCR Text]: {ocr_text[:60]}{'...' if len(ocr_text) > 60 else ''}")
+                        print(f"   [Visible Text]: {ocr_text[:60]}{'...' if len(ocr_text) > 60 else ''}")
 
-                # 2. Query Kaggle Moondream
-                print("🧠 [Kaggle Moondream]: Thinking on Kaggle GPU...")
+                # 2. Query Kaggle Moondream over Ngrok
+                print("🧠 Dhruv is thinking on Kaggle GPU...")
                 t0 = time.time()
                 response = await brain.query(client, frame, user_query, ocr_text)
                 dt = time.time() - t0
 
                 print(f"\nDhruv: {response}")
-                print(f"⏱️ (Roundtrip Latency: {dt:.2f}s)")
+                print(f"⏱️ (Response Time: {dt:.2f}s)\n")
 
-                # 3. Speak response
+                # 3. Speak response out loud via TTS
                 if AUDIO_ENABLED:
                     await speak_text(response)
 
@@ -336,6 +337,7 @@ async def run_dhruv(trigger_requested: bool = False):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="DhruvOrin Standalone Pipeline")
+    parser.add_argument("--chat", action="store_true", default=True, help="Run in text chat mode with voice output (Keyboard input + Spoken speech)")
     parser.add_argument("--trigger", action="store_true", help="Trigger Kaggle GPU instance and automatically obtain active Ngrok URL")
     args = parser.parse_args()
 
@@ -344,6 +346,6 @@ if __name__ == "__main__":
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     try:
-        asyncio.run(run_dhruv(trigger_requested=trigger_flag))
+        asyncio.run(run_dhruv(trigger_requested=trigger_flag, chat_mode=args.chat))
     except KeyboardInterrupt:
         print("\nShutdown signal received. Exiting.")
