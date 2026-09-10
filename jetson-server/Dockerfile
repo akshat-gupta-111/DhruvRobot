@@ -1,4 +1,4 @@
-FROM nvcr.io/nvidia/l4t-ml:r35.2.1-py3
+FROM python:3.11-slim
 
 # Set working directory
 WORKDIR /app
@@ -16,6 +16,7 @@ RUN apt-get update && apt-get install -y \
     libbluetooth-dev \
     mpg123 \
     alsa-utils \
+    tesseract-ocr \
     && rm -rf /var/lib/apt/lists/*
 
 # Upgrade pip and install Python dependencies

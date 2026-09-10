@@ -26,3 +26,6 @@ setuptools==69.5.1
 # Audio & TTS
 edge-tts
 pydub
+
+# OCR
+pytesseract
