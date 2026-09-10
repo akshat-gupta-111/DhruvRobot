@@ -1,7 +1,7 @@
 """
-DhruvRobot - Jetson Orin Nano Native Pipeline
-=============================================
-Zero Local Ollama | Zero LangGraph | Zero LangChain | 100% Native Async Python
+DhruvOrin - Autonomous Exploration & Voice Command Pipeline
+============================================================
+Zero Local Ollama | Zero LangGraph | Zero LangChain | 100% Native Python
 
 Modes & Architecture:
   1. 🔭 CONTINUOUS EXPLORATION MODE (Default):
@@ -42,14 +42,23 @@ if hasattr(sys.stdout, "reconfigure"):
 
 BASE_DIR = Path(__file__).parent.resolve()
 load_dotenv(BASE_DIR / ".env", override=True)
-if (BASE_DIR / "DhruvOrin" / ".env").exists():
-    load_dotenv(BASE_DIR / "DhruvOrin" / ".env", override=False)
+if (BASE_DIR.parent / ".env").exists():
+    load_dotenv(BASE_DIR.parent / ".env", override=False)
 
 # Ensure Kaggle CLI discovers kaggle.json
-if (BASE_DIR / "DhruvOrin" / "kaggle.json").exists():
-    os.environ.setdefault("KAGGLE_CONFIG_DIR", str(BASE_DIR / "DhruvOrin"))
-elif (BASE_DIR / "Trigger" / "kaggle.json").exists():
-    os.environ.setdefault("KAGGLE_CONFIG_DIR", str(BASE_DIR / "Trigger"))
+if (BASE_DIR / "kaggle.json").exists():
+    os.environ.setdefault("KAGGLE_CONFIG_DIR", str(BASE_DIR))
+elif (BASE_DIR.parent / "Trigger" / "kaggle.json").exists():
+    os.environ.setdefault("KAGGLE_CONFIG_DIR", str(BASE_DIR.parent / "Trigger"))
+
+# Known Figures & Facial Recognition Engine with MediaPipe Hands & JSON Profile Lookup
+try:
+    from test_known import JarvisVisionEngine
+except ImportError:
+    try:
+        from DhruvOrin.test_known import JarvisVisionEngine
+    except ImportError:
+        JarvisVisionEngine = None
 
 # =====================================================================
 # CONFIGURATION
@@ -58,6 +67,10 @@ CAMERA_INDEX = int(os.getenv("CAMERA_INDEX", "0"))
 AUDIO_ENABLED = os.getenv("AUDIO_ENABLED", "true").lower() in ("true", "1", "yes")
 TTS_VOICE = os.getenv("TTS_VOICE", "en-IN-NeerjaNeural")
 TTS_SPEED = os.getenv("TTS_SPEED", "+20%")
+
+# ── Known Figures & People Recognition ────────────────────────────────
+KNOWN_FACES_DIR = os.getenv("KNOWN_FACES_DIR", str(BASE_DIR / "known_faces"))
+PEOPLE_CONTEXT_PATH = os.getenv("PEOPLE_CONTEXT_PATH", str(BASE_DIR / "people_context.json"))
 
 # ── Vision Backend: Moondream on Kaggle GPU via Ngrok ────────────────
 NGROK_BASE_URL = os.getenv("NGROK_BASE_URL", "").rstrip("/")
@@ -298,6 +311,7 @@ class WakeWordListener:
 
                 try:
                     text = recognizer.recognize_google(audio).lower().strip()
+                    # Check for wake word matches
                     if any(t in text for t in self.WAKE_TRIGGERS):
                         print(f"\n⚡ [Wake Word Detected via Mic]: \"{text}\"")
                         self.callback()
@@ -358,7 +372,7 @@ class DhruvBrainEngine:
         self.ngrok_url = new_url.rstrip("/")
         self.vision_endpoint = f"{self.ngrok_url}/api/generate"
 
-    async def get_scene_caption(self, client: httpx.AsyncClient, frame, ocr_text: str) -> str:
+    async def get_scene_caption(self, client: httpx.AsyncClient, frame, ocr_text: str = "", figure_context_str: str = "") -> str:
         """Calls Moondream on Kaggle GPU to describe the current video frame."""
         if frame is None or not self.ngrok_url:
             return ""
@@ -381,6 +395,7 @@ class DhruvBrainEngine:
                 scene_desc = res.json().get("response", "").strip()
                 self.last_visual_context = (
                     f"SCENE DESCRIPTION: {scene_desc}\n"
+                    f"PEOPLE & FIGURES IN SCENE: {figure_context_str if figure_context_str else 'No recognized figures.'}\n"
                     f"VISIBLE TEXT DETECTED: {ocr_text if ocr_text else 'No legible text found.'}"
                 )
                 return scene_desc
@@ -388,7 +403,7 @@ class DhruvBrainEngine:
             print(f"[Vision Warning]: {e}")
         return ""
 
-    async def generate_exploration_observation(self, client: httpx.AsyncClient, scene_desc: str, ocr_text: str) -> str:
+    async def generate_exploration_observation(self, client: httpx.AsyncClient, scene_desc: str, ocr_text: str = "", figure_context_str: str = "") -> str:
         """Generates a lively, natural observation about the surroundings in exploration mode."""
         past_str = "\n".join([f"- {obs}" for obs in self.past_observations[-3:]]) if self.past_observations else "None yet."
 
@@ -396,6 +411,7 @@ class DhruvBrainEngine:
 
 CURRENT SENSORY INPUT:
 Scene: {scene_desc}
+Recognized People / Figures: {figure_context_str if figure_context_str else 'None'}
 Visible Text: {ocr_text if ocr_text else 'None'}
 
 Previous observations you already shared:
@@ -403,10 +419,12 @@ Previous observations you already shared:
 
 Guidelines for this observation:
 1. Speak a single, natural 1-2 sentence spoken observation about what you notice right now.
-2. Focus on an interesting detail, object, person, activity, or subtle change.
-3. Sound lively, observant, and curious.
-4. Do NOT repeat the exact sentences or ideas from previous observations.
-5. Do not use emojis or bullet points."""
+2. If a RECOGNIZED PERSON or FIGURE is in view, prioritize acknowledging them personally using their biographical context! Tailor your interaction (e.g., greet your creator/mentor warmly and mention their work or passion).
+3. CRITICAL: If you already greeted this person in recent observations, DO NOT keep repeating the greeting; instead, comment on what they are doing, their hand gestures (e.g. fingers held up), or the surrounding scene.
+4. Focus on an interesting detail, object, person, activity, or subtle change.
+5. Sound lively, observant, and curious.
+6. Do NOT repeat the exact sentences or ideas from previous observations.
+7. Do not use emojis or bullet points."""
 
         messages = [
             {"role": "system", "content": prompt},
@@ -455,23 +473,26 @@ Guidelines for this observation:
         except Exception as e:
             return f"Azure Connection Error: {e}"
 
-    async def execute_command(self, client: httpx.AsyncClient, frame, user_query: str, ocr_text: str) -> str:
-        """Executes user command with full LangGraph persona and visual awareness."""
+    async def execute_command(self, client: httpx.AsyncClient, frame, user_query: str, ocr_text: str = "", figure_context_str: str = "") -> str:
+        """Executes user command with full LangGraph persona, visual awareness, and person context."""
         if frame is not None:
-            await self.get_scene_caption(client, frame, ocr_text)
+            await self.get_scene_caption(client, frame, ocr_text, figure_context_str)
+
+        human_ctx = f"\nPEOPLE / FIGURES PRESENT:\n{figure_context_str}" if figure_context_str else ""
 
         system_prompt = f"""You are Dhruv, an intelligent, living robotic companion.
-You can 'see' your environment through a dual-pipeline vision system that provides both a scene description and raw OCR text.
+You can 'see' your environment through a multi-modal vision system providing scene descriptions, facial recognition with known identity profiles, hand gesture tracking, and raw OCR text.
 
-CURRENT VISUAL CONTEXT:
-{self.last_visual_context}
+CURRENT VISUAL & HUMAN CONTEXT:
+{self.last_visual_context}{human_ctx}
 
 Guidelines for responding:
-1. If the user asks what you see, synthesize the SCENE DESCRIPTION and VISIBLE TEXT DETECTED naturally.
-2. The VISIBLE TEXT DETECTED might contain typos or fragmented words (raw OCR data). Use your intelligence to infer what the text actually says based on the scene context.
-3. If the user asks you to read something, quote the text from the VISIBLE TEXT section.
-4. If the user asks a general question, answer it directly and intelligently using your broad knowledge.
-5. Respond conversationally in 1-3 spoken sentences. Dont use emojis."""
+1. If a known person is detected in front of you, you know exactly who you are speaking to! Use their profile and background from the context to personalize your response, greeting, and relationship.
+2. If the user asks what you see, who is in front of you, or asks about hand gestures/fingers, synthesize the SCENE DESCRIPTION, RECOGNIZED PEOPLE, and HAND GESTURES naturally.
+3. The VISIBLE TEXT DETECTED might contain typos or fragmented words (raw OCR data). Use your intelligence to infer what the text actually says based on the scene context.
+4. If the user asks you to read something, quote the text from the VISIBLE TEXT section.
+5. If the user asks a general question, answer it directly and intelligently using your broad knowledge.
+6. Respond conversationally in 1-3 spoken sentences. Dont use emojis."""
 
         messages = [{"role": "system", "content": system_prompt}]
         messages.extend(self.history[-6:])
@@ -501,7 +522,7 @@ def get_or_trigger_ngrok_url(force_trigger: bool = False) -> str:
         return active_url
 
     try:
-        from DhruvOrin.trigger import trigger_and_get_url
+        from trigger import trigger_and_get_url
         print("[*] Contacting Kaggle to obtain active Ngrok tunnel...")
         url = trigger_and_get_url(timeout_seconds=60)
         if url:
@@ -523,9 +544,22 @@ async def run_dhruv(trigger_requested: bool = False):
     ngrok_url = get_or_trigger_ngrok_url(force_trigger=trigger_requested)
     brain = DhruvBrainEngine(ngrok_url)
 
-    print(f"🧠 Brain Engine (LLM) : AZURE AI ({AZURE_DEPLOYMENT})")
-    print(f"👁️ Vision Engine (VLM): MOONDREAM on Kaggle ({ngrok_url if ngrok_url else 'Not connected'})")
-    print(f"🔊 Spoken Voice       : {'ENABLED (' + TTS_VOICE + ' @ ' + TTS_SPEED + ')' if AUDIO_ENABLED else 'DISABLED'}")
+    # Initialize Known Figures & Face Recognition Engine
+    vision_engine = None
+    if JarvisVisionEngine is not None:
+        try:
+            vision_engine = JarvisVisionEngine(
+                known_faces_dir=KNOWN_FACES_DIR,
+                context_json_path=PEOPLE_CONTEXT_PATH
+            )
+        except Exception as e:
+            print(f"[Vision Engine Notice]: Could not initialize face engine: {e}")
+
+    active_profiles = len(vision_engine.known_face_names) if vision_engine else 0
+    print(f"🧠 Brain Engine (LLM)   : AZURE AI ({AZURE_DEPLOYMENT})")
+    print(f"👁️ Vision Engine (VLM)  : MOONDREAM on Kaggle ({ngrok_url if ngrok_url else 'Not connected'})")
+    print(f"👤 Known Figures Engine : {f'ACTIVE ({active_profiles} profiles loaded)' if active_profiles > 0 else 'Active (0 reference faces)' if vision_engine else 'DISABLED'}")
+    print(f"🔊 Spoken Voice         : {'ENABLED (' + TTS_VOICE + ' @ ' + TTS_SPEED + ')' if AUDIO_ENABLED else 'DISABLED'}")
     print("─" * 68)
     print("Mode 1: 🔭 CONTINUOUS EXPLORATION (Observing & speaking scene details)")
     print("Mode 2: ⚡ COMMAND ACCEPTING (Say 'Listen Dhruv !' to interrupt)")
@@ -561,18 +595,32 @@ async def run_dhruv(trigger_requested: bool = False):
                     print("🔭 [Exploration Mode]: Analyzing surroundings...")
                     frame = None
                     ocr_text = ""
+                    figure_context_str = ""
 
                     grabbed, raw_frame = cam.read()
                     if grabbed and raw_frame is not None:
                         frame = raw_frame
                         ocr_text = extract_text_locally(frame)
+                        if vision_engine is not None:
+                            try:
+                                fingers, names, contexts, figure_context_str, _ = vision_engine.process_frame(frame)
+                                recognized_known = [n for n in names if n != "Unknown"]
+                                if recognized_known:
+                                    print(f"👤 [Spotted Known Figure]: {', '.join(recognized_known)}")
+                                    for rk in recognized_known:
+                                        if rk in contexts:
+                                            print(f"   📖 [Bio]: {contexts[rk]}")
+                                if fingers > 0:
+                                    print(f"   🖐️ [Gestures]: {fingers} fingers held up")
+                            except Exception as e:
+                                print(f"[Face Recognition Warning]: {e}")
 
                     # Get scene description from Moondream on Kaggle GPU
-                    scene_desc = await brain.get_scene_caption(client, frame, ocr_text)
+                    scene_desc = await brain.get_scene_caption(client, frame, ocr_text, figure_context_str)
 
                     if scene_desc and not wake_event.is_set():
                         # Generate a fresh 1-2 sentence lively observation
-                        observation = await brain.generate_exploration_observation(client, scene_desc, ocr_text)
+                        observation = await brain.generate_exploration_observation(client, scene_desc, ocr_text, figure_context_str)
                         if observation and not wake_event.is_set():
                             print(f"\n🔭 Dhruv Observes: \"{observation}\"\n")
                             if AUDIO_ENABLED:
@@ -624,14 +672,23 @@ async def run_dhruv(trigger_requested: bool = False):
                         # Grab fresh live frame for visual commands
                         frame = None
                         ocr_text = ""
+                        figure_context_str = ""
                         grabbed, raw_frame = cam.read()
                         if grabbed and raw_frame is not None:
                             frame = raw_frame
                             ocr_text = extract_text_locally(frame)
+                            if vision_engine is not None:
+                                try:
+                                    fingers, names, contexts, figure_context_str, _ = vision_engine.process_frame(frame)
+                                    recognized_known = [n for n in names if n != "Unknown"]
+                                    if recognized_known:
+                                        print(f"👤 [Command from]: {', '.join(recognized_known)}")
+                                except Exception as e:
+                                    print(f"[Face Recognition Warning]: {e}")
 
                         print("🧠 Dhruv is reasoning on your command...")
                         t0 = time.time()
-                        response = await brain.execute_command(client, frame, user_command, ocr_text)
+                        response = await brain.execute_command(client, frame, user_command, ocr_text, figure_context_str)
                         dt = time.time() - t0
 
                         print(f"\nDhruv: {response}")
@@ -651,11 +708,13 @@ async def run_dhruv(trigger_requested: bool = False):
             print("\nShutting down hardware interfaces...")
             voice_listener.stop()
             cam.stop()
+            if vision_engine is not None:
+                vision_engine.release()
             print("Dhruv: Offline.")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="DhruvRobot Pipeline")
+    parser = argparse.ArgumentParser(description="DhruvOrin Autonomous Pipeline")
     parser.add_argument("--trigger", action="store_true", help="Trigger Kaggle GPU instance and automatically obtain active Ngrok URL")
     args = parser.parse_args()
 

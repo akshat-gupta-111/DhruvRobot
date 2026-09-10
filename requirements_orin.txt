@@ -1,6 +1,6 @@
 # ========================================================
-# DhruvRobot - Jetson Orin Nano Lightweight Dependencies
-# Zero LangGraph / Zero LangChain
+# DhruvOrin - Standalone Jetson Orin Nano Dependencies
+# Zero LangGraph | Zero LangChain | 100% Pure Python
 # ========================================================
 
 # Computer Vision & OCR
@@ -8,13 +8,20 @@ opencv-python>=4.8.0
 pytesseract>=0.3.10
 numpy>=1.24.0
 
-# Asynchronous HTTP & Console
+# Asynchronous HTTP & Terminal
 httpx>=0.25.0
 aioconsole>=0.6.0
 python-dotenv>=1.0.0
 
-# Text-to-Speech (requires mpv or aplay installed on Jetson: sudo apt-get install -y mpv)
+# Text-to-Speech & Speech Recognition (Wake Word: "Listen Dhruv !")
 edge-tts>=6.1.0
+SpeechRecognition>=3.10.0
+# Note on Jetson / Linux: sudo apt-get install -y portaudio19-dev libasound2-dev mpv
+PyAudio>=0.2.13
 
-# Optional: If you want to use local Piper TTS offline
-# piper-tts
+# Known Figure Identification & Gesture Analysis
+face-recognition>=1.3.0
+mediapipe>=0.10.0
+
+# Optional: Kaggle CLI for triggering remote Moondream GPU
+kaggle>=1.6.0

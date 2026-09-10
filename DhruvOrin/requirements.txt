@@ -13,8 +13,15 @@ httpx>=0.25.0
 aioconsole>=0.6.0
 python-dotenv>=1.0.0
 
-# Text-to-Speech (requires mpv on Jetson: sudo apt-get install -y mpv)
+# Text-to-Speech & Speech Recognition (Wake Word: "Listen Dhruv !")
 edge-tts>=6.1.0
+SpeechRecognition>=3.10.0
+# Note on Jetson / Linux: sudo apt-get install -y portaudio19-dev libasound2-dev mpv
+PyAudio>=0.2.13
+
+# Known Figure Identification & Gesture Analysis
+face-recognition>=1.3.0
+mediapipe>=0.10.0
 
 # Optional: Kaggle CLI for triggering remote Moondream GPU
 kaggle>=1.6.0
