@@ -1,0 +1,20 @@
+# ========================================================
+# DhruvOrin - Standalone Jetson Orin Nano Dependencies
+# Zero LangGraph | Zero LangChain | 100% Pure Python
+# ========================================================
+
+# Computer Vision & OCR
+opencv-python>=4.8.0
+pytesseract>=0.3.10
+numpy>=1.24.0
+
+# Asynchronous HTTP & Terminal
+httpx>=0.25.0
+aioconsole>=0.6.0
+python-dotenv>=1.0.0
+
+# Text-to-Speech (requires mpv on Jetson: sudo apt-get install -y mpv)
+edge-tts>=6.1.0
+
+# Optional: Kaggle CLI for triggering remote Moondream GPU
+kaggle>=1.6.0
