@@ -1,7 +1,19 @@
-# DhruvOrin: Standalone Jetson Orin Nano Architecture
-Zero LangGraph | Zero LangChain | 100% Pure Python
+# DhruvOrin: Standalone Jetson Edge + Kaggle GPU Architecture
+Zero Local Ollama | Zero LangGraph | Zero LangChain | 100% Pure Python
 
-This folder is **completely self-contained**. You can copy this entire `DhruvOrin` directory directly to your NVIDIA Jetson Orin Nano (or any Linux/Windows/Mac machine) and run the full robot intelligence pipeline with a single command.
+This folder is **completely self-contained**.
+
+### How it works:
+- **Local Device (Jetson / PC)**:
+  - Captures frames from USB / CSI camera (zero buffer lag).
+  - Extracts visible text via fast local CPU OCR (`pytesseract`).
+  - Plays spoken responses via speaker (Edge-TTS via `mpv`/`aplay`).
+- **Remote Cloud (Kaggle GPU via Ngrok)**:
+  - Runs **Ollama** and **Moondream** on a free Kaggle GPU.
+  - Exposes port 11434 through a public Ngrok tunnel.
+  - Receives the camera frame + OCR text + user query over HTTP and runs high-speed VLM inference.
+
+There is **NO local Ollama** and **NO LangGraph**.
 
 ---
 
@@ -9,61 +21,34 @@ This folder is **completely self-contained**. You can copy this entire `DhruvOri
 
 | File | Purpose |
 | :--- | :--- |
-| `main.py` | **Master single-script runner**: Controls the camera, local OCR, Moondream VLM, pure-Python brain, and audio TTS. |
-| `trigger.py` | Kaggle GPU automation: Wraps `llava.py` into a notebook, pushes it to Kaggle, and monitors the Ngrok tunnel. |
-| `llava.py` | Remote Kaggle worker script: Installs Ollama, pulls Moondream, and starts the Ngrok tunnel. |
+| `main.py` | **Master runner**: Captures camera, local OCR, queries Kaggle Moondream, and speaks response. |
+| `trigger.py` | Kaggle GPU automation: Pushes `llava.py` to Kaggle and extracts the active Ngrok tunnel URL. |
+| `llava.py` | Kaggle remote worker: Installs Ollama, pulls Moondream, starts server, and establishes Ngrok tunnel. |
 | `kernel-metadata.json` | Kaggle notebook configuration for GPU cloud runs. |
 | `kaggle.json` | Kaggle API credentials. |
-| `requirements.txt` | Clean, minimal dependencies (no LangGraph, no LangChain). |
-| `.env` | Active configuration file. |
-| `.env.example` | Template for environment variables and model selection. |
+| `requirements.txt` | Clean, minimal dependencies (no LangGraph, no LangChain, ~60MB footprint). |
+| `.env` | Active configuration file with `NGROK_BASE_URL`. |
 
 ---
 
-## 🚀 Quick Start Guide
+## 🚀 How to Run
 
-### 1. System Packages (on Jetson Linux)
+### 1. Install Dependencies
 ```bash
-sudo apt-get update
+# On Jetson Linux:
 sudo apt-get install -y tesseract-ocr mpv
-```
 
-### 2. Install Python Dependencies
-```bash
+# Python packages:
+cd DhruvOrin
 pip install -r requirements.txt
 ```
 
-### 3. Running Dhruv
+### 2. Start Dhruv
 
-#### Mode A: 100% On-Device (Jetson Local Ollama)
-Run Moondream and the LLM locally on your Jetson Orin Nano:
 ```bash
-# Pull models in Ollama (once)
-ollama pull moondream
-ollama pull qwen2.5:1.5b
-
-# Start Dhruv
+# If Kaggle is already running:
 python main.py
-```
 
-#### Mode B: With Kaggle GPU Moondream Server
-Offload vision to a free Kaggle GPU instance while running reasoning on your Jetson:
-```bash
-# Option 1: Trigger Kaggle automatically
+# If you want to automatically trigger Kaggle and discover the URL:
 python main.py --trigger
-
-# Option 2: Run trigger manually in a separate terminal
-python trigger.py
-# (Copy the resulting Ngrok URL into .env as NGROK_BASE_URL)
-python main.py
 ```
-
----
-
-## ⚙️ Configuration (`.env`)
-
-- `LLM_BACKEND`: `ollama` (default for local Jetson) or `azure`.
-- `OLLAMA_LLM_MODEL`: `qwen2.5:1.5b` (or `llama3.2:1b`).
-- `MOONDREAM_BACKEND`: `ollama` (local or Kaggle Ngrok) or `cloud`.
-- `NGROK_BASE_URL`: Paste your active Ngrok URL if using Kaggle.
-- `AUDIO_ENABLED`: `true` or `false`.
