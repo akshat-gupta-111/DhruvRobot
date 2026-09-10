@@ -103,6 +103,31 @@ class LiveCameraStream:
 # =====================================================================
 # 2. LOCAL VISION LAYER: FAST CPU OCR
 # =====================================================================
+
+# Keywords that signal the user wants visual context sent to the AI
+_VISION_KEYWORDS = (
+    "see", "look", "show", "watch", "scene", "camera", "view",
+    "describe", "what is", "what's", "around", "front", "visible",
+    "image", "picture", "photo", "detect", "identify", "read",
+    "screen", "display", "text on", "sign", "object", "person",
+    "background", "color", "colour", "environment", "room", "place",
+)
+
+def is_vision_query(query: str) -> bool:
+    """Returns True only if the user explicitly asks about something visual."""
+    q = query.lower()
+    return any(kw in q for kw in _VISION_KEYWORDS)
+
+
+def get_fresh_frame(cam: "LiveCameraStream"):
+    """Flush the V4L2 buffer and return the most recent live frame."""
+    # Read and discard several buffered frames so we get the current one
+    for _ in range(5):
+        cam.read()
+    grabbed, frame = cam.read()
+    return grabbed, frame
+
+
 def extract_text_locally(frame) -> str:
     """Runs local Tesseract OCR on CPU frame to catch written text."""
     if frame is None:
@@ -366,15 +391,20 @@ async def run_dhruv(trigger_requested: bool = False, chat_mode: bool = True):
                 if user_query.lower() in ("exit", "quit", "q"):
                     break
 
-                # 1. Capture camera frame (if camera is active)
+                # 1. Capture camera frame ONLY for vision-related queries
                 frame = None
                 ocr_text = ""
-                grabbed, raw_frame = cam.read()
-                if grabbed and raw_frame is not None:
-                    frame = raw_frame
-                    ocr_text = extract_text_locally(frame)
-                    if ocr_text:
-                        print(f"   [Visible Text]: {ocr_text[:60]}{'...' if len(ocr_text) > 60 else ''}")
+                if is_vision_query(user_query):
+                    grabbed, raw_frame = get_fresh_frame(cam)  # flush buffer → live frame
+                    if grabbed and raw_frame is not None:
+                        frame = raw_frame
+                        ocr_text = extract_text_locally(frame)
+                        if ocr_text:
+                            print(f"   [Visible Text]: {ocr_text[:60]}{'...' if len(ocr_text) > 60 else ''}")
+                        print("   [📷 Live camera frame captured]")
+                    else:
+                        print("   [Camera]: No frame available.")
+                # else: pure text query → no image sent → Moondream answers as a chatbot
 
                 # 2. Query Kaggle Moondream over Ngrok
                 print("🧠 Dhruv is thinking on Kaggle GPU...")
